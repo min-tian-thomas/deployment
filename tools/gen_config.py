@@ -12,6 +12,7 @@ from typing import Dict, List, Set, Tuple
 import yaml
 
 from schema_validation import validate_all_schemas
+from binary_resolver import load_binary_target
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -207,80 +208,6 @@ def load_app_config(app_name: str) -> Dict:
         )
 
     return app_cfg
-
-
-def load_binary_requirements() -> Dict[str, Dict]:
-    """加载 deployments/required_binaries.yaml 中的全部 binary 定义。"""
-
-    req_file = ROOT / "deployments" / "required_binaries.yaml"
-    if not req_file.exists():
-        raise SystemExit(f"binary requirements file not found: {req_file}")
-
-    with req_file.open() as f:
-        data = yaml.safe_load(f) or {}
-
-    if not isinstance(data, dict):
-        raise SystemExit(f"invalid format in {req_file}, expected mapping of binary -> config")
-
-    return data
-
-
-def load_binary_target(binary_name: str, tag_or_version: str) -> Path:
-    """根据 deployments/required_binaries.yaml 解析出具体版本的本地路径，并返回目标二进制路径。
-
-    约定目录结构：
-
-    deployments/
-      required_binaries.yaml
-
-    install/
-      binaries/
-        md_server/
-          v1.2.3/
-            md_server          # 实际二进制文件（本 MVP 中可为 mock）
-    """
-
-    req_file = ROOT / "deployments" / "required_binaries.yaml"
-    data = load_binary_requirements()
-
-    binary_cfg: Dict = data.get(binary_name) or {}
-    if not binary_cfg:
-        raise SystemExit(f"binary '{binary_name}' not defined in {req_file}")
-
-    tags: Dict = binary_cfg.get("tags") or {}
-    required_versions_raw = binary_cfg.get("required_versions") or []
-    required_versions = {str(v) for v in required_versions_raw}
-
-    # 先将 tag_or_version 解析为具体 version
-    if tag_or_version in tags:
-        version = str(tags[tag_or_version])
-    else:
-        version = str(tag_or_version)
-
-    if required_versions and version not in required_versions:
-        raise SystemExit(
-            f"version '{version}' (from tag '{tag_or_version}') not in required_versions "
-            f"for binary '{binary_name}' in {req_file}"
-        )
-
-    bin_dir = ROOT / "install" / "binaries" / binary_name / version
-    bin_dir.mkdir(parents=True, exist_ok=True)
-
-    bin_path = bin_dir / binary_name
-
-    # 如果二进制不存在，创建一个简单的 mock 可执行文件
-    if not bin_path.exists():
-        bin_path.write_text(
-            "#!/usr/bin/env bash\n" f"echo 'mock {binary_name} {version}' \"$@\"\n",
-            encoding="utf-8",
-        )
-        # 尝试设置可执行权限（在非类 Unix 系统上失败也无妨）
-        try:
-            bin_path.chmod(0o755)
-        except PermissionError:
-            pass
-
-    return bin_path
 
 
 def validate_and_render(
@@ -630,7 +557,7 @@ def validate_and_render(
             last_cfg_path = cfg_path
 
         # 解析 binary + tag/version，创建或指向具体版本的二进制
-        bin_target = load_binary_target(binary_name, tag_or_version)
+        bin_target = load_binary_target(ROOT, binary_name, tag_or_version)
 
         # 在应用目录下创建可执行文件 symlink：<app_name> -> binaries/.../<binary_name>
         exec_path = apps_root / app_name

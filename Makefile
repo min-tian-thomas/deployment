@@ -69,3 +69,7 @@ config:
 .PHONY: binaries
 binaries:
 	$(PYTHON) tools/gen_binaries.py
+
+.PHONY: test
+test:
+	$(PYTHON) -m unittest discover -s tests -v

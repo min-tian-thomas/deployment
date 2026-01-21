@@ -4,34 +4,16 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Dict
-
-import yaml
+from binary_resolver import load_binary_requirements
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_binary_requirements() -> Dict[str, Dict]:
-    req_file = ROOT / "deployments" / "required_binaries.yaml"
-    if not req_file.exists():
-        raise SystemExit(f"binary requirements file not found: {req_file}")
-
-    with req_file.open() as f:
-        data = yaml.safe_load(f) or {}
-
-    if not isinstance(data, dict):
-        raise SystemExit(
-            f"invalid format in {req_file}, expected mapping of binary -> config"
-        )
-
-    return data
 
 
 def prepare_all_binaries() -> None:
     binaries_root = ROOT / "install" / "binaries"
     binaries_root.mkdir(parents=True, exist_ok=True)
 
-    data = load_binary_requirements()
+    data = load_binary_requirements(ROOT)
 
     for binary_name, cfg in data.items():
         if not isinstance(cfg, dict):
