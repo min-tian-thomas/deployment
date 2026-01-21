@@ -1,0 +1,9 @@
+# This will help to download the required binaries from LFS or other sources
+md_server:
+  tags:
+    prod: v1.2.3
+    staging: v1.2.4-rc1
+  required_versions:
+    - v1.2.3
+    - v1.2.4-rc1
+    - v1.2.2

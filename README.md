@@ -14,7 +14,7 @@ deployment/
     dce_md_publisher.yaml       # application abstraction (binary + tag + template)
 
   binaries/
-    md_server.yaml              # binary tags (prod/staging/latest)
+    md_server.yaml              # binary tags (prod/staging,...)
 
   datacenters/
     datacenters.yaml            # DC + host CPU topology description
@@ -70,24 +70,24 @@ datacenters:
 
 ### deploy/idc_shanghai/deployments.yaml
 
-```yaml
-deployments:
-  host01:
-    shared_cpus: 0, 1  # for logging and admin
+Canonical schema (current MVP): top-level **host → apps** mapping
 
-    dce_md_publisher:
-      isolated_cpus: 2
-      cfg_envs:
-        - listen_nic: eth0
-          listen_port: 8080
-          log_cpu: 0
-          main_loop_cpu: 2
-          admin_loop_cpu: 1
+```yaml
+host01:
+  dce_md_publisher:
+    isolated_cpus: 2
+    cfg_envs:
+      listen_nic: eth0
+      listen_port: 8080
+      log_cpu: 0
+      main_loop_cpu: 2
+      admin_loop_cpu: 1
 ```
 
-- `shared_cpus`: CPUs allowed to run logging / admin work.
-- `<app_name>`: per-app deployment section under a host.
-- `cfg_envs[0]`: MVP only uses the first entry as the configuration source.
+- Top-level keys are host names (e.g. `host01`).
+- Under each host, keys are app names (e.g. `dce_md_publisher`).
+- `cfg_envs` can be either a single mapping (as above) or a list of
+  mappings; the tool currently uses only the first entry when it is a list.
 
 ### deploy/idc_shanghai/schedules.yaml
 
@@ -170,13 +170,24 @@ make requirements
 # 2) create venv and install dependencies from requirements.txt
 make venv
 
-# 3) generate configs for all known dc/host/app
+# 3) (optional) prepare mock binaries layout from binaries/*.yaml
+make binaries
+
+# 4) generate configs for all known dc/host/app
 make config
+```
+
+`make binaries` will call `tools/gen_config.py binaries` and, for each
+`binaries/<name>.yaml`, create mock binaries under:
+
+```text
+binaries/<name>/<version>/<name>
 ```
 
 `make config` will run `tools/gen_config.py` without arguments, which scans
 all datacenters / hosts / apps described in the YAML files and prints
-CPU/NUMA mappings plus the paths of the generated JSON configs.
+CPU/NUMA mappings plus the paths of the generated JSON configs and
+application directories under `deploy/<dc>/applications/<host>/<app>/`.
 
 ## Notes / Next steps
 

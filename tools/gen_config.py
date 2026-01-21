@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Set
@@ -36,36 +38,89 @@ def parse_cpu_set(expr: str) -> Set[int]:
 
 
 def load_datacenter(dc_id: str, host_name: str) -> Dict:
-    dc_file = ROOT / "datacenters" / "datacenters.yaml"
+    """加载某个 DC 下指定主机的拓扑信息。
+
+    现在的拓扑文件放在 deploy/<dc>/hosts.yaml，结构类似：
+
+    datacenters:
+      - id: idc_shanghai
+        hosts:
+          - name: host01
+            cpus: 16
+            numa_nodes:
+              - id: 0
+                cpus: 0-7
+              - id: 1
+                cpus: 8-15
+            ...
+    """
+
+    dc_file = ROOT / "deploy" / dc_id / "hosts.yaml"
+    if not dc_file.exists():
+        raise SystemExit(f"hosts topology file not found for datacenter '{dc_id}': {dc_file}")
+
     with dc_file.open() as f:
-        data = yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
 
+    # 兼容旧写法：带 datacenters 列表
     dcs: List[Dict] = data.get("datacenters") or []
-    dc = next((d for d in dcs if d.get("id") == dc_id), None)
-    if not dc:
-        raise SystemExit(f"datacenter '{dc_id}' not found in {dc_file}")
+    if dcs:
+        dc = next((d for d in dcs if d.get("id") == dc_id), None)
+        if not dc:
+            raise SystemExit(f"datacenter '{dc_id}' not found in {dc_file}")
 
-    hosts: List[Dict] = dc.get("hosts") or []
-    host = next((h for h in hosts if h.get("name") == host_name), None)
-    if not host:
-        raise SystemExit(f"host '{host_name}' not found in datacenter '{dc_id}'")
+        hosts: List[Dict] = dc.get("hosts") or []
+        host = next((h for h in hosts if h.get("name") == host_name), None)
+        if not host:
+            raise SystemExit(f"host '{host_name}' not found in datacenter '{dc_id}'")
+
+        return host
+
+    # 新写法：顶层就是 host 映射
+    hosts_map: Dict = data or {}
+    host = hosts_map.get(host_name)
+    if not isinstance(host, dict):
+        raise SystemExit(f"host '{host_name}' not found in {dc_file}")
 
     return host
 
 
-def build_cpu_numa_map(total_cpus: int, numa_nodes: int) -> Dict[int, int]:
+def build_cpu_numa_map_from_host(host: Dict) -> Dict[int, int]:
+    """根据 host.numa_nodes 字段构建 cpu -> numa_node 的映射。
+
+    支持两种写法：
+    - 显式 numa_nodes 列表（推荐，目前 hosts.yaml 的写法）
+    - 旧写法：numa_nodes 是整数，均匀切分 cpu
+    """
+
+    mapping: Dict[int, int] = {}
+
+    nodes = host.get("numa_nodes")
+    # 新写法：列表，每个元素包含 id 和 cpus 范围
+    if isinstance(nodes, list):
+        for node in nodes:
+            node_id = int(node.get("id", 0))
+            cpus_expr = str(node.get("cpus", ""))
+            for cpu in parse_cpu_set(cpus_expr):
+                mapping[cpu] = node_id
+        return mapping
+
+    # 兼容旧写法：按整数 numa_nodes 均匀切分
+    total_cpus = int(host.get("cpus", 0))
+    numa_nodes = int(nodes or 1)
     if total_cpus <= 0 or numa_nodes <= 0:
         raise ValueError("cpus and numa_nodes must be positive")
+
     base = total_cpus // numa_nodes
     rem = total_cpus % numa_nodes
 
-    mapping: Dict[int, int] = {}
     cpu = 0
-    for node in range(numa_nodes):
-        count = base + (1 if node < rem else 0)
+    for node_id in range(numa_nodes):
+        count = base + (1 if node_id < rem else 0)
         for _ in range(count):
-            mapping[cpu] = node
+            mapping[cpu] = node_id
             cpu += 1
+
     return mapping
 
 
@@ -84,10 +139,31 @@ def load_deployment(dc_id: str, host_name: str, app_name: str) -> Dict:
 
     dep_file = ROOT / "deploy" / dc_id / "deployments.yaml"
     with dep_file.open() as f:
-        data = yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
 
-    deployments = data.get("deployments") or {}
-    host_cfg: Dict = deployments.get(host_name) or {}
+    # 旧写法：deployments[host][app]
+    if "deployments" in data:
+        deployments = data.get("deployments") or {}
+        host_cfg: Dict = deployments.get(host_name) or {}
+        if not host_cfg:
+            raise SystemExit(
+                f"no deployments defined for host '{host_name}' in {dep_file}"
+            )
+
+        app_def: Dict = host_cfg.get(app_name) or {}
+        if not app_def:
+            raise SystemExit(
+                f"no app '{app_name}' defined under host '{host_name}' in {dep_file}"
+            )
+
+        return {
+            "shared_cpus": host_cfg.get("shared_cpus", ""),
+            "app": app_def,
+        }
+
+    # 新写法：顶层就是 host -> apps 映射
+    hosts_map: Dict = data or {}
+    host_cfg: Dict = hosts_map.get(host_name) or {}
     if not host_cfg:
         raise SystemExit(f"no deployments defined for host '{host_name}' in {dep_file}")
 
@@ -98,21 +174,13 @@ def load_deployment(dc_id: str, host_name: str, app_name: str) -> Dict:
         )
 
     return {
-        "shared_cpus": host_cfg.get("shared_cpus", ""),
+        "shared_cpus": "",  # shared_cpus 由 hosts.yaml 提供
         "app": app_def,
     }
 
 
 def load_app_config(app_name: str) -> Dict:
-    """加载 apps/ 下的应用定义。
-
-    期望结构：
-
-    dce_md_publisher:
-      binary: md_server
-      tag: prod
-      config_template: dce_md_publisher.json
-    """
+    """加载 apps/ 下的应用定义（旧写法使用，新写法使用 deployments.yaml 中的 binary/tag/templates）。"""
 
     app_file = ROOT / "apps" / f"{app_name}.yaml"
     if not app_file.exists():
@@ -130,27 +198,251 @@ def load_app_config(app_name: str) -> Dict:
     return app_cfg
 
 
+def load_binary_requirements() -> Dict[str, Dict]:
+    """加载 binaries/requirements.yaml 中的全部 binary 定义。"""
+
+    req_file = ROOT / "binaries" / "requirements.yaml"
+    if not req_file.exists():
+        raise SystemExit(f"binary requirements file not found: {req_file}")
+
+    with req_file.open() as f:
+        data = yaml.safe_load(f) or {}
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"invalid format in {req_file}, expected mapping of binary -> config")
+
+    return data
+
+
+def load_binary_target(binary_name: str, tag_or_version: str) -> Path:
+    """根据 binaries/requirements.yaml 解析出具体版本的本地路径，并返回目标二进制路径。
+
+    约定目录结构：
+
+    binaries/
+      requirements.yaml
+      md_server/
+        v1.2.3/
+          md_server          # 实际二进制文件（本 MVP 中可为 mock）
+    """
+
+    req_file = ROOT / "binaries" / "requirements.yaml"
+    data = load_binary_requirements()
+
+    binary_cfg: Dict = data.get(binary_name) or {}
+    if not binary_cfg:
+        raise SystemExit(f"binary '{binary_name}' not defined in {req_file}")
+
+    tags: Dict = binary_cfg.get("tags") or {}
+    required_versions_raw = binary_cfg.get("required_versions") or []
+    required_versions = {str(v) for v in required_versions_raw}
+
+    # 先将 tag_or_version 解析为具体 version
+    if tag_or_version in tags:
+        version = str(tags[tag_or_version])
+    else:
+        version = str(tag_or_version)
+
+    if required_versions and version not in required_versions:
+        raise SystemExit(
+            f"version '{version}' (from tag '{tag_or_version}') not in required_versions "
+            f"for binary '{binary_name}' in {req_file}"
+        )
+
+    bin_dir = ROOT / "binaries" / binary_name / version
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    bin_path = bin_dir / binary_name
+
+    # 如果二进制不存在，创建一个简单的 mock 可执行文件
+    if not bin_path.exists():
+        bin_path.write_text(
+            "#!/usr/bin/env bash\n" f"echo 'mock {binary_name} {version}' \"$@\"\n",
+            encoding="utf-8",
+        )
+        # 尝试设置可执行权限（在非类 Unix 系统上失败也无妨）
+        try:
+            bin_path.chmod(0o755)
+        except PermissionError:
+            pass
+
+    return bin_path
+
+
 def validate_and_render(
     dc_id: str = "idc_shanghai", host_name: str = "host01", app_name: str = APP_NAME
 ) -> Path:
     host = load_datacenter(dc_id, host_name)
     total_cpus = int(host.get("cpus", 0))
-    numa_nodes = int(host.get("numa_nodes", 1))
-    log_cpus = parse_cpu_set(str(host.get("log_cpus", "")))
     isolated_cpus = parse_cpu_set(str(host.get("isolated_cpus", "")))
+    host_shared_cpus = parse_cpu_set(str(host.get("shared_cpus", "")))
 
-    cpu_numa = build_cpu_numa_map(total_cpus, numa_nodes)
+    cpu_numa = build_cpu_numa_map_from_host(host)
 
     dep_info = load_deployment(dc_id, host_name, app_name)
-    shared_cpus = parse_cpu_set(str(dep_info.get("shared_cpus", "")))
+    dep_shared_cpus = parse_cpu_set(str(dep_info.get("shared_cpus", "")))
+    # 优先使用 hosts.yaml 中的 shared_cpus，兼容旧 schema 时退回 deployments 里的 shared_cpus
+    shared_cpus = host_shared_cpus or dep_shared_cpus
 
     app_def: Dict = dep_info["app"]
 
-    cfg_envs: List[Dict] = app_def.get("cfg_envs") or []
-    if not cfg_envs:
-        raise SystemExit("cfg_envs is empty in deployments definition")
+    # 构建应用目录结构：deploy/<dc>/<host>/<app>/
+    apps_root = ROOT / "deploy" / dc_id / host_name / app_name
+    apps_root.mkdir(parents=True, exist_ok=True)
 
-    env = cfg_envs[0]
+    # 新写法：deployments.yaml 中为每个 app 定义 binary/tag 和 templates 列表
+    templates = app_def.get("templates")
+    if templates:
+        binary_name = app_def.get("binary")
+        if not binary_name:
+            raise SystemExit(
+                f"binary not defined for app '{app_name}' in deployments.yaml (dc={dc_id}, host={host_name})"
+            )
+
+        tag_or_version = str(app_def.get("tag") or app_def.get("version") or "prod")
+
+        last_cfg_path: Path | None = None
+
+        for tmpl in templates:
+            if not isinstance(tmpl, dict):
+                continue
+
+            template_name = tmpl.get("name")
+            if not template_name:
+                raise SystemExit(
+                    f"template 'name' is required for app '{app_name}' in deployments.yaml (dc={dc_id}, host={host_name})"
+                )
+
+            cfg_envs_obj = tmpl.get("cfg_envs")
+            if isinstance(cfg_envs_obj, list):
+                cfg_envs: List[Dict] = cfg_envs_obj
+                if not cfg_envs:
+                    raise SystemExit("cfg_envs is empty in deployments definition")
+                env = cfg_envs[0]
+            elif isinstance(cfg_envs_obj, dict):
+                env = cfg_envs_obj
+            else:
+                raise SystemExit(
+                    "cfg_envs must be a mapping or a list of mappings in deployments definition"
+                )
+
+            try:
+                log_cpu = int(env["log_cpu"])
+                main_loop_cpu = int(env["main_loop_cpu"])
+                admin_loop_cpu = int(env["admin_loop_cpu"])
+            except KeyError as e:
+                raise SystemExit(f"missing cpu field in cfg_envs: {e}")
+
+            used_cpus = {log_cpu, main_loop_cpu, admin_loop_cpu}
+
+            # 1) busy spin 的 cpu_id（main_loop_cpu）必须在 isolated_cpus 范围内
+            if main_loop_cpu not in isolated_cpus:
+                raise SystemExit(
+                    f"main_loop_cpu {main_loop_cpu} not in isolated_cpus {sorted(isolated_cpus)}"
+                )
+
+            # 2) log_cpu 必须在 shared_cpus 范围内
+            if log_cpu not in shared_cpus:
+                raise SystemExit(
+                    f"log_cpu {log_cpu} not in shared_cpus {sorted(shared_cpus)}"
+                )
+
+            # 3) 所有 cpu id 必须在合法范围 [0, total_cpus)
+            for cpu in used_cpus:
+                if cpu < 0 or cpu >= total_cpus:
+                    raise SystemExit(
+                        f"cpu id {cpu} out of range [0, {total_cpus}) for host {host_name}"
+                    )
+
+            # 4) 配置文件中的 cpu_id 不允许重复
+            if len(used_cpus) != 3:
+                raise SystemExit(
+                    "duplicated cpu ids detected among log_cpu/main_loop_cpu/admin_loop_cpu: "
+                    f"{sorted(used_cpus)}"
+                )
+
+            # 生成 NUMA comments（打印到 stdout，方便审阅）
+            print(f"CPU NUMA mapping for used CPUs (template {template_name}):")
+            for cpu in sorted(used_cpus):
+                node = cpu_numa.get(cpu, -1)
+                print(f"  cpu {cpu}: numa_node {node}")
+
+            template_path = ROOT / "deploy" / dc_id / "templates" / template_name
+            if not template_path.exists():
+                raise SystemExit(f"template file not found: {template_path}")
+
+            template_text = template_path.read_text()
+
+            # 将 listen_nic (网卡名) 替换为对应 IP
+            nic_name = env.get("listen_nic")
+            if not nic_name:
+                raise SystemExit("listen_nic is not specified in cfg_envs")
+
+            nic_ip = None
+            for nic in host.get("nics", []):
+                if nic.get("name") == nic_name:
+                    nic_ip = nic.get("ip")
+                    break
+            if not nic_ip:
+                raise SystemExit(
+                    f"ip for nic '{nic_name}' not found in hosts.yaml for host '{host_name}'"
+                )
+
+            replacements = {
+                "listen_nic": nic_ip,
+                "listen_port": env.get("listen_port"),
+                "log_cpu": log_cpu,
+                "main_loop_cpu": main_loop_cpu,
+                "admin_loop_cpu": admin_loop_cpu,
+            }
+
+            rendered = template_text
+            for key, value in replacements.items():
+                rendered = rendered.replace("{{" + key + "}}", str(value))
+
+            # 简单校验生成的 JSON 是否合法
+            try:
+                json.loads(rendered)
+            except json.JSONDecodeError as e:
+                print("Rendered JSON is invalid:")
+                print(rendered)
+                raise SystemExit(f"failed to parse rendered JSON: {e}")
+
+            # 写入配置文件：使用模板名作为文件名
+            cfg_path = apps_root / template_name
+            cfg_path.write_text(rendered + "\n")
+            last_cfg_path = cfg_path
+
+        # 解析 binary + tag/version，创建或指向具体版本的二进制
+        bin_target = load_binary_target(binary_name, tag_or_version)
+
+        # 在应用目录下创建可执行文件 symlink：<app_name> -> binaries/.../<binary_name>
+        exec_path = apps_root / app_name
+        if exec_path.is_symlink() or exec_path.exists():
+            exec_path.unlink()
+
+        # 使用相对路径创建 symlink，保证仓库可移动
+        rel_target = os.path.relpath(bin_target, start=apps_root)
+        os.symlink(rel_target, exec_path)
+
+        print(f"generated app directory: {apps_root}")
+        if last_cfg_path is not None:
+            print(f"  last config: {last_cfg_path}")
+        print(f"  binary symlink: {exec_path} -> {rel_target}")
+        # 返回最后一个模板生成的配置路径
+        return last_cfg_path if last_cfg_path is not None else exec_path
+
+    # 旧写法：app_def 直接包含 cfg_envs，binary/tag 由 apps/<app>.yaml 提供
+    cfg_envs_obj = app_def.get("cfg_envs")
+    if isinstance(cfg_envs_obj, list):
+        cfg_envs: List[Dict] = cfg_envs_obj
+        if not cfg_envs:
+            raise SystemExit("cfg_envs is empty in deployments definition")
+        env = cfg_envs[0]
+    elif isinstance(cfg_envs_obj, dict):
+        env = cfg_envs_obj
+    else:
+        raise SystemExit("cfg_envs must be a mapping or a list of mappings in deployments definition")
 
     try:
         log_cpu = int(env["log_cpu"])
@@ -192,7 +484,7 @@ def validate_and_render(
         node = cpu_numa.get(cpu, -1)
         print(f"  cpu {cpu}: numa_node {node}")
 
-    # 渲染模板
+    # 渲染模板 & 准备二进制（旧写法从 apps/<app>.yaml 读取 template/binary/tag）
     app_cfg = load_app_config(app_name)
     template_name = app_cfg.get("config_template")
     if not template_name:
@@ -203,8 +495,23 @@ def validate_and_render(
     template_path = ROOT / "deploy" / dc_id / "templates" / template_name
     template_text = template_path.read_text()
 
+    # 将 listen_nic (网卡名) 替换为对应 IP
+    nic_name = env.get("listen_nic")
+    if not nic_name:
+        raise SystemExit("listen_nic is not specified in cfg_envs")
+
+    nic_ip = None
+    for nic in host.get("nics", []):
+        if nic.get("name") == nic_name:
+            nic_ip = nic.get("ip")
+            break
+    if not nic_ip:
+        raise SystemExit(
+            f"ip for nic '{nic_name}' not found in hosts.yaml for host '{host_name}'"
+        )
+
     replacements = {
-        "listen_nic": env.get("listen_nic"),
+        "listen_nic": nic_ip,
         "listen_port": env.get("listen_port"),
         "log_cpu": log_cpu,
         "main_loop_cpu": main_loop_cpu,
@@ -223,52 +530,100 @@ def validate_and_render(
         print(rendered)
         raise SystemExit(f"failed to parse rendered JSON: {e}")
 
-    out_path = ROOT / "deploy" / dc_id / f"{app_name}_{host_name}.json"
-    out_path.write_text(rendered + "\n")
+    # 写入配置文件：<app>.json
+    cfg_path = apps_root / f"{app_name}.json"
+    cfg_path.write_text(rendered + "\n")
 
-    print(f"generated config written to: {out_path}")
-    return out_path
+    # 解析 binary + tag，创建或指向具体版本的二进制
+    binary_name = app_cfg.get("binary")
+    if not binary_name:
+        raise SystemExit(f"binary not defined for app '{app_name}' in apps/{app_name}.yaml")
+
+    tag = str(app_cfg.get("tag", "prod"))
+    bin_target = load_binary_target(binary_name, tag)
+
+    # 在应用目录下创建可执行文件 symlink：<app_name> -> binaries/.../<binary_name>
+    exec_path = apps_root / app_name
+    if exec_path.is_symlink() or exec_path.exists():
+        exec_path.unlink()
+
+    # 使用相对路径创建 symlink，保证仓库可移动
+    rel_target = os.path.relpath(bin_target, start=apps_root)
+    os.symlink(rel_target, exec_path)
+
+    print(f"generated app directory: {apps_root}")
+    print(f"  config: {cfg_path}")
+    print(f"  binary symlink: {exec_path} -> {rel_target}")
+    return cfg_path
 
 
 def generate_all() -> None:
     """遍历所有 datacenter/host/app，生成对应配置。
 
     依赖约定：
-    - datacenters/datacenters.yaml 列出所有 dc 和 hosts
     - 每个 dc 对应 deploy/<dc>/deployments.yaml
+    - 部分 dc 还可以有 deploy/<dc>/hosts.yaml，提供 CPU/NUMA 拓扑
     - deployments.yaml 中：
         deployments[host].shared_cpus
         deployments[host][app_name] 为该 app 的部署定义
     """
 
-    dc_file = ROOT / "datacenters" / "datacenters.yaml"
-    with dc_file.open() as f:
-        dc_data = yaml.safe_load(f) or {}
+    deploy_root = ROOT / "deploy"
+    if not deploy_root.exists():
+        return
 
-    datacenters = dc_data.get("datacenters") or []
-
-    for dc in datacenters:
-        dc_id = dc.get("id")
-        if not dc_id:
+    for dc_dir in deploy_root.iterdir():
+        if not dc_dir.is_dir():
             continue
 
-        dep_file = ROOT / "deploy" / dc_id / "deployments.yaml"
-        if not dep_file.exists():
+        dc_id = dc_dir.name
+        dep_file = dc_dir / "deployments.yaml"
+        hosts_file = dc_dir / "hosts.yaml"
+        if not dep_file.exists() or not hosts_file.exists():
             continue
+
+        with hosts_file.open() as f:
+            hosts_data = yaml.safe_load(f) or {}
 
         with dep_file.open() as f:
             dep_data = yaml.safe_load(f) or {}
 
+        # 新写法：顶层就是 host -> apps 映射
+        if "deployments" not in dep_data:
+            hosts_map: Dict = dep_data or {}
+            for host_name, apps_map in hosts_map.items():
+                if not isinstance(apps_map, dict):
+                    continue
+
+                # 校验 host 存在
+                if host_name not in hosts_data:
+                    print(
+                        f"host '{host_name}' in {dep_file} not found in hosts.yaml",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                for app_name, app_def in apps_map.items():
+                    if not isinstance(app_def, dict):
+                        continue
+
+                    print(f"[generate] dc={dc_id} host={host_name} app={app_name}")
+                    try:
+                        validate_and_render(dc_id, host_name, app_name)
+                    except SystemExit as e:
+                        print(f"  failed: {e}", file=sys.stderr)
+
+            continue
+
+        # 兼容旧写法：deployments[host][app]
         deployments = dep_data.get("deployments") or {}
         for host_name, host_cfg in deployments.items():
-            # 校验 host 在 datacenters.yaml 中存在
             try:
                 _ = load_datacenter(dc_id, host_name)
             except SystemExit as e:
                 print(e, file=sys.stderr)
                 continue
 
-            # 跳过非 app 的键（目前只保留 shared_cpus 作为 host 级别配置）
             for app_name, app_def in host_cfg.items():
                 if app_name == "shared_cpus":
                     continue
@@ -282,10 +637,62 @@ def generate_all() -> None:
                     print(f"  failed: {e}", file=sys.stderr)
 
 
+def prepare_all_binaries() -> None:
+    """根据 binaries/requirements.yaml 中的 required_versions 布局所有 mock 二进制文件，并清理不再需要的版本。"""
+
+    binaries_dir = ROOT / "binaries"
+    if not binaries_dir.exists():
+        return
+
+    req_file = binaries_dir / "requirements.yaml"
+    data = load_binary_requirements()
+
+    for binary_name, cfg in data.items():
+        if not isinstance(cfg, dict):
+            continue
+
+        required_versions_raw = cfg.get("required_versions") or []
+        required_versions = {str(v) for v in required_versions_raw}
+        if not required_versions:
+            continue
+
+        bin_root = binaries_dir / binary_name
+        bin_root.mkdir(parents=True, exist_ok=True)
+
+        # 为所有 required_versions 创建 mock 二进制
+        for version in sorted(required_versions):
+            print(f"[binary] {binary_name}:{version}")
+            bin_dir = bin_root / version
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            bin_path = bin_dir / binary_name
+            if not bin_path.exists():
+                bin_path.write_text(
+                    "#!/usr/bin/env bash\n"
+                    f"echo 'mock {binary_name} {version}' \"$@\"\n",
+                    encoding="utf-8",
+                )
+                try:
+                    bin_path.chmod(0o755)
+                except PermissionError:
+                    pass
+
+        # 清理不在 required_versions 中的旧版本目录
+        if bin_root.exists():
+            for child in bin_root.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name not in required_versions:
+                    print(f"[binary-clean] removing obsolete version: {binary_name}/{child.name}")
+                    shutil.rmtree(child, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    # 无参数：全局生成
+    # 无参数：全局生成配置
     if len(sys.argv) == 1:
         generate_all()
+    # 单参数："binaries"，只准备 mock 二进制布局
+    elif len(sys.argv) == 2 and sys.argv[1] == "binaries":
+        prepare_all_binaries()
     # 2 个参数：dc host（默认 APP_NAME）
     elif len(sys.argv) == 3:
         _, dc, host = sys.argv

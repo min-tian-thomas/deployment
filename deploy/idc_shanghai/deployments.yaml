@@ -1,13 +1,12 @@
-deployments:
-  host01:
-    shared_cpus: 0, 1  # for logging and admin
-    
-    dce_md_publisher:
-      isolated_cpus: 2
-      cfg_envs:
-        -
-          listen_nic: eth0
+host01:
+  dce_md_publisher:
+    binary: md_server
+    tag: prod  # or version like: v1.2.3
+    templates:
+      - name: dce_md_publisher.json
+        cfg_envs:
+          listen_nic: eth0  # 192.168.1.100
           listen_port: 8080
-          log_cpu: 0
-          main_loop_cpu: 2
-          admin_loop_cpu: 1
+          log_cpu: 0        # numa 0
+          main_loop_cpu: 2  # numa 0
+          admin_loop_cpu: 1 # numa 0

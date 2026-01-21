@@ -64,3 +64,8 @@ format:
 .PHONY: config
 config: venv
 	$(PYTHON) tools/gen_config.py
+
+# Prepare mock binaries layout based on binaries/*.yaml
+.PHONY: binaries
+binaries: venv
+	$(PYTHON) tools/gen_config.py binaries
