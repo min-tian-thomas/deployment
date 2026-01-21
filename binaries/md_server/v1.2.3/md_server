@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo 'mock md_server v1.2.3' "$@"

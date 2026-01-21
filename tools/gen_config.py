@@ -557,6 +557,93 @@ def validate_and_render(
     return cfg_path
 
 
+def refresh_deployment_comments_for_dc(
+    dc_id: str,
+    hosts_data: Dict,
+    dep_data: Dict,
+    dep_file: Path,
+) -> None:
+    """根据 hosts.yaml 信息刷新 deployments.yaml 中的注释。
+
+    - listen_nic: <nic_name>  # <ip>
+    - *_cpu: <cpu_id>  # numa <id>
+
+    仅支持新 schema（顶层 host -> apps 映射），旧 schema 直接忽略。
+    该函数会重写 deployments.yaml 文件，丢弃原有注释，生成新的注释。
+    """
+
+    lines: List[str] = []
+
+    for host_name, apps_map in dep_data.items():
+        if not isinstance(apps_map, dict):
+            continue
+
+        lines.append(f"{host_name}:")
+
+        host_topology = hosts_data.get(host_name) or {}
+        try:
+            cpu_numa = build_cpu_numa_map_from_host(host_topology)
+        except Exception:
+            cpu_numa = {}
+
+        nic_ips: Dict[str, str] = {}
+        for nic in host_topology.get("nics", []):
+            name = str(nic.get("name"))
+            ip = nic.get("ip")
+            if name and ip:
+                nic_ips[name] = str(ip)
+
+        for app_name, app_def in apps_map.items():
+            if not isinstance(app_def, dict):
+                continue
+
+            lines.append(f"  {app_name}:")
+
+            # 输出 binary / tag / version 等简单字段
+            for key in ("binary", "tag", "version"):
+                if key in app_def:
+                    lines.append(f"    {key}: {app_def[key]}")
+
+            templates = app_def.get("templates")
+            if not templates:
+                continue
+
+            lines.append("    templates:")
+            for tmpl in templates:
+                if not isinstance(tmpl, dict):
+                    continue
+
+                template_name = tmpl.get("name")
+                lines.append(f"      - name: {template_name}")
+
+                cfg_envs = tmpl.get("cfg_envs") or {}
+                if not isinstance(cfg_envs, dict):
+                    continue
+
+                lines.append("        cfg_envs:")
+
+                for env_key, env_val in cfg_envs.items():
+                    comment = ""
+
+                    if env_key == "listen_nic":
+                        ip = nic_ips.get(str(env_val))
+                        if ip:
+                            comment = f"  # {ip}"
+                    elif env_key in ("log_cpu", "main_loop_cpu", "admin_loop_cpu"):
+                        try:
+                            cpu_id = int(env_val)
+                        except (TypeError, ValueError):
+                            cpu_id = None
+                        if cpu_id is not None:
+                            node = cpu_numa.get(cpu_id)
+                            if node is not None:
+                                comment = f"  # numa {node}"
+
+                    lines.append(f"          {env_key}: {env_val}{comment}")
+
+    dep_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def generate_all() -> None:
     """遍历所有 datacenter/host/app，生成对应配置。
 
@@ -591,6 +678,16 @@ def generate_all() -> None:
         # 新写法：顶层就是 host -> apps 映射
         if "deployments" not in dep_data:
             hosts_map: Dict = dep_data or {}
+
+            # 在生成配置前，根据 hosts.yaml 刷新一次注释
+            refresh_deployment_comments_for_dc(dc_id, hosts_data, hosts_map, dep_file)
+
+            # 重新读取（数据结构未变，这一步主要是确保我们使用的是最新文件）
+            with dep_file.open() as f:
+                dep_data = yaml.safe_load(f) or {}
+
+            hosts_map = dep_data or {}
+
             for host_name, apps_map in hosts_map.items():
                 if not isinstance(apps_map, dict):
                     continue
