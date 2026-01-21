@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -18,6 +19,10 @@ APP_NAME = "dce_md_publisher"
 
 # 记录同一 host 上 busy-spin（main_loop_cpu）在 isolated_cpus 中的使用情况，用于跨应用去重校验
 HOST_BUSY_ISOLATED_USAGE: Dict[Tuple[str, str], Dict[int, str]] = {}
+
+# 全局应用索引：强制 app_name 在所有 dc/host 之间唯一，用于跨实例引用
+# 结构：APP_GLOBAL_INDEX[app_name] = (dc_id, host_name)
+APP_GLOBAL_INDEX: Dict[str, Tuple[str, str]] = {}
 
 
 def parse_cpu_set(expr: str) -> Set[int]:
@@ -418,39 +423,71 @@ def validate_and_render(
                 "admin_loop_cpu": admin_loop_cpu,
             }
 
-            # 支持在模板中引用其他实例（目前主要是 dce_md_publisher）的 env：
-            # 例如 {{dce_md_publisher.listen_nic}} / {{dce_md_publisher.listen_port}}
+            # 通用跨实例引用：支持 {{AppName.key}}，可以跨 host / 跨 dc。
             cross_refs: Dict[str, str] = {}
-            try:
-                pub_dep = load_deployment(dc_id, host_name, "dce_md_publisher")
-                pub_app_def: Dict = pub_dep.get("app") or {}
 
-                pub_templates = pub_app_def.get("templates")
-                if isinstance(pub_templates, list) and pub_templates:
-                    pub_tmpl0 = pub_templates[0]
-                    pub_cfg_envs = pub_tmpl0.get("cfg_envs") or {}
+            # 解析模板中出现的 AppName.key 形式的占位符
+            placeholder_pattern = re.compile(r"{{\s*([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\s*}}")
+            ref_pairs = set(placeholder_pattern.findall(template_text))
+
+            for ref_app, ref_key in ref_pairs:
+                # 通过全局索引找到被引用应用所在的 dc / host
+                mapping = APP_GLOBAL_INDEX.get(ref_app)
+                if mapping is None:
+                    raise SystemExit(
+                        f"referenced application '{ref_app}' not found in any deployments.yaml "
+                        f"(used in template {template_name} for app '{app_name}')"
+                    )
+
+                ref_dc, ref_host = mapping
+
+                # 加载被引用 app 的部署定义
+                try:
+                    ref_dep = load_deployment(ref_dc, ref_host, ref_app)
+                except SystemExit as e:
+                    raise SystemExit(
+                        f"failed to load referenced app '{ref_app}' (dc={ref_dc}, host={ref_host}): {e}"
+                    )
+
+                ref_app_def: Dict = ref_dep.get("app") or {}
+                ref_templates = ref_app_def.get("templates")
+                if isinstance(ref_templates, list) and ref_templates:
+                    ref_tmpl0 = ref_templates[0]
+                    ref_cfg_envs = ref_tmpl0.get("cfg_envs") or {}
                 else:
-                    pub_cfg_envs = pub_app_def.get("cfg_envs") or {}
+                    ref_cfg_envs = ref_app_def.get("cfg_envs") or {}
 
-                if isinstance(pub_cfg_envs, dict):
-                    pub_nic_name = pub_cfg_envs.get("listen_nic")
-                    pub_port = pub_cfg_envs.get("listen_port")
+                if not isinstance(ref_cfg_envs, dict):
+                    raise SystemExit(
+                        f"cfg_envs for referenced app '{ref_app}' is not a mapping "
+                        f"(dc={ref_dc}, host={ref_host})"
+                    )
 
-                    if pub_nic_name:
-                        pub_ip = None
-                        for nic in host.get("nics", []):
-                            if nic.get("name") == pub_nic_name:
-                                pub_ip = nic.get("ip")
-                                break
-                        if pub_ip:
-                            cross_refs["dce_md_publisher.listen_nic"] = str(pub_ip)
+                if ref_key not in ref_cfg_envs:
+                    raise SystemExit(
+                        f"key '{ref_key}' not found in cfg_envs of referenced app '{ref_app}' "
+                        f"(dc={ref_dc}, host={ref_host})"
+                    )
 
-                    if pub_port is not None:
-                        cross_refs["dce_md_publisher.listen_port"] = str(pub_port)
+                raw_val = ref_cfg_envs[ref_key]
 
-            except SystemExit:
-                # 如果 publisher 未定义或 schema 不匹配，则忽略交叉引用
-                pass
+                # listen_nic 需要根据对应 host 的 hosts.yaml 解析为 IP。
+                if ref_key == "listen_nic" and raw_val is not None:
+                    ref_host_topo = load_datacenter(ref_dc, ref_host)
+                    ref_nics = ref_host_topo.get("nics", [])
+                    ref_ip = None
+                    for nic in ref_nics:
+                        if nic.get("name") == str(raw_val):
+                            ref_ip = nic.get("ip")
+                            break
+                    if ref_ip is None:
+                        raise SystemExit(
+                            f"ip for nic '{raw_val}' not found in hosts.yaml for referenced app "
+                            f"'{ref_app}' (dc={ref_dc}, host={ref_host})"
+                        )
+                    cross_refs[f"{ref_app}.{ref_key}"] = str(ref_ip)
+                else:
+                    cross_refs[f"{ref_app}.{ref_key}"] = str(raw_val)
 
             replacements.update(cross_refs)
 
@@ -727,13 +764,80 @@ def generate_all() -> None:
         deployments[host][app_name] 为该 app 的部署定义
     """
 
-    global HOST_BUSY_ISOLATED_USAGE
+    global HOST_BUSY_ISOLATED_USAGE, APP_GLOBAL_INDEX
     HOST_BUSY_ISOLATED_USAGE = {}
+    APP_GLOBAL_INDEX = {}
 
     deploy_root = ROOT / "deployments"
     if not deploy_root.exists():
         return
 
+    # 第一遍：构建全局 APP 索引，强制 app_name 在所有 dc/host 之间唯一
+    for dc_dir in deploy_root.iterdir():
+        if not dc_dir.is_dir():
+            continue
+
+        dc_id = dc_dir.name
+        dep_file = dc_dir / "deployments.yaml"
+        if not dep_file.exists():
+            continue
+
+        with dep_file.open() as f:
+            dep_data = yaml.safe_load(f) or {}
+
+        # 新写法：顶层 host -> apps
+        if "deployments" not in dep_data:
+            hosts_map: Dict = dep_data or {}
+            for host_name, apps_map in hosts_map.items():
+                if not isinstance(apps_map, dict):
+                    continue
+                for app_name, app_def in apps_map.items():
+                    if not isinstance(app_def, dict):
+                        continue
+                    prev = APP_GLOBAL_INDEX.get(app_name)
+                    if prev is not None and prev != (dc_id, host_name):
+                        prev_dc, prev_host = prev
+                        raise SystemExit(
+                            "application '{app}' defined multiple times: "
+                            "(dc={dc1}, host={h1}) and (dc={dc2}, host={h2}); "
+                            "application names must be globally unique".format(
+                                app=app_name,
+                                dc1=prev_dc,
+                                h1=prev_host,
+                                dc2=dc_id,
+                                h2=host_name,
+                            )
+                        )
+                    APP_GLOBAL_INDEX[app_name] = (dc_id, host_name)
+
+        # 旧写法：deployments[host][app]
+        else:
+            deployments_map = dep_data.get("deployments") or {}
+            for host_name, host_cfg in deployments_map.items():
+                if not isinstance(host_cfg, dict):
+                    continue
+                for app_name, app_def in host_cfg.items():
+                    if app_name == "shared_cpus":
+                        continue
+                    if not isinstance(app_def, dict):
+                        continue
+                    prev = APP_GLOBAL_INDEX.get(app_name)
+                    if prev is not None and prev != (dc_id, host_name):
+                        prev_dc, prev_host = prev
+                        raise SystemExit(
+                            "application '{app}' defined multiple times: "
+                            "(dc={dc1}, host={h1}) and (dc={dc2}, host={h2}); "
+                            "application names must be globally unique".format(
+                                app=app_name,
+                                dc1=prev_dc,
+                                h1=prev_host,
+                                dc2=dc_id,
+                                h2=host_name,
+                            )
+                        )
+                    APP_GLOBAL_INDEX[app_name] = (dc_id, host_name)
+
+    # 第二遍：按 dc/host/app 生成配置
     for dc_dir in deploy_root.iterdir():
         if not dc_dir.is_dir():
             continue
@@ -752,7 +856,7 @@ def generate_all() -> None:
 
         # 新写法：顶层就是 host -> apps 映射
         if "deployments" not in dep_data:
-            hosts_map: Dict = dep_data or {}
+            hosts_map = dep_data or {}
 
             # 在生成配置前，根据 hosts.yaml 刷新一次注释
             refresh_deployment_comments_for_dc(dc_id, hosts_data, hosts_map, dep_file)
@@ -788,8 +892,8 @@ def generate_all() -> None:
             continue
 
         # 兼容旧写法：deployments[host][app]
-        deployments = dep_data.get("deployments") or {}
-        for host_name, host_cfg in deployments.items():
+        deployments_map = dep_data.get("deployments") or {}
+        for host_name, host_cfg in deployments_map.items():
             try:
                 _ = load_datacenter(dc_id, host_name)
             except SystemExit as e:
