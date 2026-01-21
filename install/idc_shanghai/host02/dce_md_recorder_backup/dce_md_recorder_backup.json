@@ -1,0 +1,22 @@
+{
+
+    "logging": {
+        "log_level": "Info",
+        "log_cpu": "0"
+    },
+    "event_loops": [
+        {
+            "name": "main_loop",
+            "cpu_id": "2",
+            "busy_spin": true
+        },
+        {
+            "name": "admin_loop",
+            "cpu_id": "1",
+            "busy_spin": false
+        }
+    ],
+    "connect_host": "192.168.1.101",
+    "connect_port": "12800"
+}
+

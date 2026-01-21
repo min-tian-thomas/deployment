@@ -441,6 +441,18 @@ def validate_and_render(
 
                 ref_dc, ref_host = mapping
 
+                # 任何带 shm 的 key 都被认为是共享内存相关配置，必须保证引用方和被引用方在同一台机器上
+                if "shm" in ref_key.lower() and host_name != ref_host:
+                    raise SystemExit(
+                        "shared-memory key '{app}.{key}' must be used on the same host "
+                        "(referencer host={h_ref}, owner host={h_owner})".format(
+                            app=ref_app,
+                            key=ref_key,
+                            h_ref=host_name,
+                            h_owner=ref_host,
+                        )
+                    )
+
                 # 加载被引用 app 的部署定义
                 try:
                     ref_dep = load_deployment(ref_dc, ref_host, ref_app)
