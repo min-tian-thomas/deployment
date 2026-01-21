@@ -16,6 +16,8 @@
         }
     ],
     "listen_nic": "192.168.1.101",
-    "listen_port": "12800"
+    "listen_port": "12800",
+    "broadcast_queue_shm": "{{broadcast_queue_shm_path}}"
+
 }
 

@@ -16,6 +16,5 @@
             "busy_spin": false
         }
     ],
-    "connect_host": "{{dce_md_publisher.listen_nic}}",
-    "connect_port": "{{dce_md_publisher.listen_port}}"
+    "broadcast_queue_shm": "{{dce_md_publisher.broadcast_queue_shm_path}}"
 }

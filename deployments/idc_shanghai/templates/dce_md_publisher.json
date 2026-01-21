@@ -16,5 +16,7 @@
         }
     ],
     "listen_nic": "{{listen_nic}}",
-    "listen_port": "{{listen_port}}"
+    "listen_port": "{{listen_port}}",
+    "broadcast_queue_shm": "{{broadcast_queue_shm_path}}"
+
 }

@@ -16,7 +16,6 @@
             "busy_spin": false
         }
     ],
-    "connect_host": "192.168.1.101",
-    "connect_port": "12800"
+    "broadcast_queue_shm": "/dev/shm/dce_md_publisher_broadcast_queue"
 }
 

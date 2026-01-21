@@ -1,13 +1,4 @@
 host01:
-  dce_md_recorder:
-    binary: md_recorder
-    tag: prod
-    templates:
-      - name: dce_md_recorder.json
-        cfg_envs:
-          log_cpu: 0  # numa 0
-          main_loop_cpu: 2  # numa 0
-          admin_loop_cpu: 1  # numa 0
   dce_md_publisher:
     binary: md_server
     tag: prod
@@ -19,3 +10,13 @@ host01:
           admin_loop_cpu: 1  # numa 0
           listen_nic: sf0  # 192.168.1.101
           listen_port: 12800
+          broadcast_queue_shm_path: /dev/shm/dce_md_publisher_broadcast_queue
+  dce_md_recorder:
+    binary: md_recorder
+    tag: prod
+    templates:
+      - name: dce_md_recorder.json
+        cfg_envs:
+          log_cpu: 0  # numa 0
+          main_loop_cpu: 2  # numa 0
+          admin_loop_cpu: 1  # numa 0
