@@ -59,6 +59,22 @@ md_server:
             self.assertTrue(bin_path.exists())
             self.assertIn("install/binaries/md_server/v1", str(bin_path))
 
+    def test_config_renderer_rejects_undefined_template_var(self) -> None:
+        with self.assertRaises(SystemExit):
+            render_validate_and_inject(
+                template_text='{"logging": {"log_level": "Info", "log_cpu": "{{missing}}"}, "event_loops": [{"name": "admin_loop", "cpu_id": "0", "busy_spin": false}] }',
+                replacements={},
+                app_name="app",
+                template_name="t.json",
+                host_log_dir=None,
+                total_cpus=2,
+                isolated_cpus={1},
+                admin_loop_cpu=0,
+                dc_id="idc_test",
+                host_name="host01",
+                busy_usage={},
+            )
+
     def test_schema_validation_ok(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -471,3 +487,184 @@ host02:
             admin_loop_cpu=0,
         )
         self.assertIn("listen_nic", rep)
+
+    def test_template_context_rejects_unknown_nic(self) -> None:
+        template_text = '{"listen_nic": "{{listen_nic}}"}'
+        env = {"listen_nic": "sf0", "listen_port": 1}
+        host = {"nics": [{"name": "eth0", "ip": "1.1.1.1"}]}
+        with self.assertRaises(SystemExit):
+            build_template_replacements(
+                template_text=template_text,
+                env=env,
+                host=host,
+                log_cpu=0,
+                main_loop_cpu=1,
+                admin_loop_cpu=0,
+            )
+
+    def test_config_renderer_rejects_missing_event_loops(self) -> None:
+        with self.assertRaises(SystemExit):
+            render_validate_and_inject(
+                template_text='{"logging": {"log_level": "Info", "log_cpu": "{{log_cpu}}"}}',
+                replacements={"log_cpu": 0, "admin_loop_cpu": 0},
+                app_name="app",
+                template_name="t.json",
+                host_log_dir=None,
+                total_cpus=2,
+                isolated_cpus={1},
+                admin_loop_cpu=0,
+                dc_id="idc_test",
+                host_name="host01",
+                busy_usage={},
+            )
+
+    def test_config_renderer_rejects_missing_logging_when_log_dir_required(self) -> None:
+        with self.assertRaises(SystemExit):
+            render_validate_and_inject(
+                template_text='{"event_loops": [{"name": "admin_loop", "cpu_id": "{{admin_loop_cpu}}", "busy_spin": false}]}',
+                replacements={"admin_loop_cpu": 0},
+                app_name="app",
+                template_name="t.json",
+                host_log_dir="/tmp/logs",
+                total_cpus=2,
+                isolated_cpus={1},
+                admin_loop_cpu=0,
+                dc_id="idc_test",
+                host_name="host01",
+                busy_usage={},
+            )
+
+    def test_config_renderer_rejects_busy_spin_cpu_not_isolated(self) -> None:
+        with self.assertRaises(SystemExit):
+            render_validate_and_inject(
+                template_text='{"logging": {"log_level": "Info", "log_cpu": "{{log_cpu}}"}, "event_loops": [{"name": "main_loop", "cpu_id": "0", "busy_spin": true}, {"name": "admin_loop", "cpu_id": "{{admin_loop_cpu}}", "busy_spin": false}] }',
+                replacements={"log_cpu": 0, "admin_loop_cpu": 1},
+                app_name="app",
+                template_name="t.json",
+                host_log_dir=None,
+                total_cpus=4,
+                isolated_cpus={2, 3},
+                admin_loop_cpu=1,
+                dc_id="idc_test",
+                host_name="host01",
+                busy_usage={},
+            )
+
+    def test_config_renderer_rejects_busy_spin_cpu_reuse(self) -> None:
+        busy_usage = {2: "other_app"}
+        with self.assertRaises(SystemExit):
+            render_validate_and_inject(
+                template_text='{"logging": {"log_level": "Info", "log_cpu": "{{log_cpu}}"}, "event_loops": [{"name": "main_loop", "cpu_id": "2", "busy_spin": true}, {"name": "admin_loop", "cpu_id": "{{admin_loop_cpu}}", "busy_spin": false}] }',
+                replacements={"log_cpu": 0, "admin_loop_cpu": 1},
+                app_name="app",
+                template_name="t.json",
+                host_log_dir=None,
+                total_cpus=4,
+                isolated_cpus={2, 3},
+                admin_loop_cpu=1,
+                dc_id="idc_test",
+                host_name="host01",
+                busy_usage=busy_usage,
+            )
+
+    def test_schema_validation_rejects_unknown_host_level_key(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "deployments" / "idc_test" / "templates").mkdir(parents=True)
+            (root / "install").mkdir(parents=True)
+
+            (root / "deployments" / "required_binaries.yaml").write_text(
+                """
+md_server:
+  tags:
+    prod: v1
+  required_versions:
+    - v1
+""".lstrip()
+            )
+            (root / "deployments" / "idc_test" / "hosts.yaml").write_text(
+                """
+host01:
+  cpus: 2
+  isolated_cpus: 1
+  shared_cpus: 0
+  nics:
+    - name: eth0
+      ip: 127.0.0.1
+      type: ethernet
+""".lstrip()
+            )
+            (root / "deployments" / "idc_test" / "templates" / "app.json").write_text("{}\n")
+            (root / "deployments" / "idc_test" / "deployments.yaml").write_text(
+                """
+host01:
+  log_dir: /tmp/logs
+  foo: bar
+  app:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: app.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+""".lstrip()
+            )
+
+            with self.assertRaises(SystemExit):
+                validate_all_schemas(root)
+
+    def test_cross_ref_resolver_rejects_missing_key(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "deployments" / "idc_test").mkdir(parents=True)
+            (root / "deployments" / "idc_test" / "hosts.yaml").write_text(
+                """
+host01:
+  cpus: 2
+  isolated_cpus: 1
+  shared_cpus: 0
+  nics:
+    - name: sf0
+      ip: 10.0.0.1
+      type: solarflare
+""".lstrip()
+            )
+            (root / "deployments" / "idc_test" / "deployments.yaml").write_text(
+                """
+host01:
+  pub:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: pub.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+""".lstrip()
+            )
+
+            with self.assertRaises(SystemExit):
+                resolve_cross_app_placeholders(
+                    dc_id="idc_test",
+                    host_name="host01",
+                    template_text='{"x": "{{pub.listen_port}}"}',
+                    template_name="rec.json",
+                    app_name="rec",
+                    app_index={"pub": ("idc_test", "host01")},
+                    repo_root=root,
+                )
+
+    def test_cross_ref_resolver_shm_cross_host_guard(self) -> None:
+        with self.assertRaises(SystemExit):
+            resolve_cross_app_placeholders(
+                dc_id="idc_test",
+                host_name="host02",
+                template_text='{"x": "{{pub.some_shm_path}}"}',
+                template_name="rec.json",
+                app_name="rec",
+                app_index={"pub": ("idc_test", "host01")},
+                repo_root=Path("."),
+            )

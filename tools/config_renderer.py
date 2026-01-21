@@ -1,9 +1,30 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Dict, Set
+
+from jinja2 import StrictUndefined, TemplateError
+from jinja2.sandbox import SandboxedEnvironment
+
+
+def _build_jinja_context(flat: Dict[str, object]) -> Dict[str, object]:
+    ctx: Dict[str, object] = {}
+    for k, v in flat.items():
+        if "." not in str(k):
+            ctx[str(k)] = v
+            continue
+
+        parts = str(k).split(".")
+        cur: Dict[str, object] = ctx
+        for p in parts[:-1]:
+            nxt = cur.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[p] = nxt
+            cur = nxt
+        cur[parts[-1]] = v
+    return ctx
 
 
 def render_validate_and_inject(
@@ -20,15 +41,13 @@ def render_validate_and_inject(
     host_name: str,
     busy_usage: Dict[int, str],
 ) -> str:
-    rendered = template_text
-    for key, value in replacements.items():
-        rendered = re.sub(r"{{\s*" + re.escape(str(key)) + r"\s*}}", str(value), rendered)
-
-    leftover = re.findall(r"{{\s*[^}]+\s*}}", rendered)
-    if leftover:
+    env = SandboxedEnvironment(undefined=StrictUndefined, autoescape=False)
+    try:
+        tmpl = env.from_string(template_text)
+        rendered = tmpl.render(_build_jinja_context(replacements))
+    except TemplateError as e:
         raise SystemExit(
-            f"unresolved template variables in rendered config for app '{app_name}' "
-            f"(template {template_name}): {sorted(set(leftover))}"
+            f"failed to render template for app '{app_name}' (template {template_name}): {e}"
         )
 
     try:

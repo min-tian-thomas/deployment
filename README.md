@@ -48,10 +48,11 @@ deployment/
           dce_md_recorder_backup
 
   tools/
-    gen_config.py               # 配置生成与校验脚本
+    deployctl.py                # 统一 CLI 入口：validate / binaries / config（推荐直接使用）
+    gen_config.py               # 配置生成与校验核心逻辑（内部模块，由 deployctl 调用）
 
   Makefile                      # make binaries / make config 等辅助命令
-  requirements.txt              # Python 依赖
+  requirements.txt              # Python 依赖（通过 uv 从 requirements.in 生成）
 ```
 
 ---
@@ -157,6 +158,33 @@ host01:
     - `name`：模板文件名，对应 `deployments/<dc>/templates/<name>`；
     - `cfg_envs`：该模板的环境参数（字典）。
 
+未来可以在此基础上为每个应用扩展一些与生命周期/依赖相关的字段（当前工具链不会强制使用，仅作为规范预留）：
+
+```yaml
+host01:
+  dce_md_publisher:
+    type: framework           # framework / external，区分是否遵循统一应用框架约定
+    binary: md_server
+    tag: prod
+    depends_on:               # 可选：声明依赖的其它应用，用于 plan/start/stop 顺序
+      - dce_md_recorder
+    start_cmd: "./dce_md_publisher"          # 可选：覆盖默认启动命令
+    stop_cmd: "kill $(cat dce_md_publisher.pid)"   # 可选：覆盖默认停止命令
+    validate_cmd: "./dce_md_publisher -v"    # 可选：应用侧的配置验证命令
+    templates:
+      - name: dce_md_publisher.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 3
+          admin_loop_cpu: 1
+          listen_nic: sf0
+          listen_port: 12800
+```
+
+> 上述扩展字段目前仅作为未来规划的 schema 约定：
+> - 现有工具链不会强制解析/执行 `start_cmd` / `stop_cmd` / `validate_cmd`；
+> - 后续若引入 `deployctl plan/start/stop` 等子命令，可基于这些字段实现更强的生命周期编排。
+
 CPU / NUMA 相关约束：
 
 - `main_loop_cpu`：
@@ -210,7 +238,11 @@ CPU / NUMA 相关约束：
 }
 ```
 
-`tools/gen_config.py` 使用简单的字符串替换把 `{{...}}` 填成具体数值，并在写盘前做一次 JSON 语法校验。
+模板渲染由 Jinja2（StrictUndefined）完成，通过 CLI `tools/deployctl.py config` 调用内部模块：
+
+- 所有 `{{...}}` 变量在渲染阶段被替换为具体数值；
+- 任意未定义的模板变量（例如拼写错误或 `cfg_envs` 缺失）会在渲染阶段直接报错；
+- 渲染完成后会再做一次 JSON 语法校验。
 
 recorder 的模板可以包含跨应用引用，例如：
 
@@ -221,9 +253,9 @@ recorder 的模板可以包含跨应用引用，例如：
 
 ---
 
-## `tools/gen_config.py` 行为概览
+## 配置生成行为概览
 
-脚本对每个 `dc/host/app` 主要做以下几步：
+`make config`（或 `python tools/deployctl.py config`）对每个 `dc/host/app` 主要做以下几步：
 
 1. 从 `deployments/<dc>/hosts.yaml` 读取主机拓扑（CPU 数量、NUMA、isolated/shared CPU、网卡等）。
 2. 从 `deployments/<dc>/deployments.yaml` 读取该 host 上的应用列表及其模板配置。
@@ -232,10 +264,11 @@ recorder 的模板可以包含跨应用引用，例如：
    - 解析出目标路径 `install/binaries/<binary>/<version>/<binary>`。
 4. 对每个模板执行 CPU 相关校验（见上文）。
 5. 计算 `cpu -> numa_node` 映射，并在生成时把每个使用到的 CPU 的 NUMA 信息打印到 stdout，方便肉眼确认。
-6. 渲染模板：
+6. 使用 Jinja2 渲染模板：
    - 把 `{{log_cpu}}` / `{{main_loop_cpu}}` / `{{admin_loop_cpu}}` 等替换为具体数值；
    - 如果模板中使用了 `{{listen_nic}}`，则从 `cfg_envs.listen_nic` 和 `hosts.yaml` 解析出 IP 并替换；
-   - 支持任意模板通过 `{{OtherApp.key}}` 引用其它应用的 cfg_envs。
+   - 支持任意模板通过 `{{OtherApp.key}}` 引用其它应用的 cfg_envs；
+   - 任意未定义变量会在渲染阶段直接报错（Jinja2 StrictUndefined）。
 7. 校验渲染结果是否为合法 JSON。
 8. 若 host 设置了 `log_dir`，则强制写入 `logging.log_dir=<log_dir>/<app_name>`。
 9. 将每个模板渲染后的结果写入：
@@ -252,7 +285,7 @@ recorder 的模板可以包含跨应用引用，例如：
 
 ---
 
-## Makefile 用法
+## Makefile 与 CLI 用法
 
 当前仓库提供了一些基于 `uv` 的辅助命令，MVP 核心使用方式：
 
@@ -260,21 +293,27 @@ recorder 的模板可以包含跨应用引用，例如：
 # （可选）从 requirements.in 刷新 requirements.txt
 make requirements
 
-# （可选）为 tools/ 创建隔离虚拟环境并安装依赖
+# （推荐）为 tools/ 创建隔离虚拟环境并安装依赖
 make venv
+
+# （可选）运行单元测试，验证工具链本身
+make test
 
 # 1）根据 deployments/required_binaries.yaml 准备 / 清理二进制目录
 make binaries
 
 # 2）为所有 dc/host/app 生成配置与应用目录
 make config
+
+# 或直接调用 CLI（支持过滤）：
+python tools/deployctl.py config --dc idc_shanghai --host host01 --app dce_md_publisher
 ```
 
 - `make binaries` 会调用 `tools/gen_binaries.py`，对 `deployments/required_binaries.yaml` 中定义的每个 binary：
   - 为所有 `required_versions` 生成（或校验存在）mock 二进制 `install/binaries/<name>/<version>/<name>`；
   - 删除不在 `required_versions` 中的旧版本目录。
 
-- `make config` 会调用 `tools/gen_config.py`（无参数），扫描所有 `deployments/<dc>/deployments.yaml` 和 `hosts.yaml`，对每个 `dc/host/app`：
+- `make config` 会调用 `tools/deployctl.py config`（内部复用 `gen_config` 等模块），扫描所有 `deployments/<dc>/deployments.yaml` 和 `hosts.yaml`，对每个 `dc/host/app`：
   - 打印使用到的 CPU 与 NUMA 映射；
   - 生成配置文件到 `install/<dc>/<host>/<app>/`；
   - 为应用创建指向正确版本二进制的 symlink。
@@ -283,7 +322,7 @@ make config
 
 ## 约束与校验规则（非常重要）
 
-以下规则由 `make config`/`tools/gen_config.py` 强制校验或强制注入，违反时会直接报错退出。
+以下规则由 `make config`（底层通过 `tools/deployctl.py config` 调用内部模块）强制校验或强制注入，违反时会直接报错退出。
 
 - 应用名（application name）必须全局唯一
   - 同一个仓库内，所有 `deployments/<dc>/deployments.yaml` 中出现的应用名不允许重复。
@@ -310,7 +349,7 @@ make config
   - 此时要求引用方与被引用方必须在同一 `(dc, host)` 上，否则 `make config` 报错。
 
 - 模板变量必须可解析
-  - 渲染完成后若仍残留 `{{...}}`（例如模板变量拼写错误、cfg_envs 缺失），会直接报错。
+  - 模板由 Jinja2（StrictUndefined）渲染：若变量未在上下文中定义（例如模板变量拼写错误、`cfg_envs` 缺失），会在渲染阶段直接报错；
   - 跨应用引用时：
     - 被引用的 application 必须存在；
     - key 必须在被引用 application 的 `cfg_envs` 中存在。
@@ -321,6 +360,12 @@ make config
 
 ## 后续可扩展方向
 
-- 支持更多应用类型和更复杂的模板占位符；
-- 增强跨应用依赖描述（不仅 recorder 连接 publisher）；
-- 与远端部署系统对接（目前仅支持本地生成，不涉及远程分发）。
+- **增量生成与过滤**：在现有 `--dc/--host/--app` 的基础上，根据跨应用依赖关系只重建受影响的应用；
+- **CLI 增强**：增加 `--strict/--warn`、`--dry-run`、更详细的诊断信息；
+- **模板能力扩展**：在 Jinja2 基础上引入公共片段/宏，支持更复杂的占位符组合；
+- **与远端系统对接**：将本地生成的 `install/` 目录与远程部署/发布系统打通（目前仅支持本地生成，不涉及远程分发）。
+- **应用生命周期管理**：支持应用的启动/停止/重启/版本升级等生命周期管理，例如通过 `./app -v/-c` 等命令行工具。
+- **依赖关系与调度**：支持应用之间的依赖关系，并根据依赖关系进行调度和排序，确保应用按照正确的顺序启动和停止。
+- **非框架应用支持**：支持非框架应用（即不遵循标准应用框架的应用）的部署和管理，例如通过提供特定的配置文件或命令行参数。
+
+---

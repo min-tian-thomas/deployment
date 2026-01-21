@@ -63,7 +63,7 @@ format:
 # Generate config for the default DC/host using tools/gen_config.py
 .PHONY: config
 config:
-	$(PYTHON) tools/gen_config.py
+	$(PYTHON) tools/deployctl.py config
 
 # Prepare mock binaries layout based on binaries/*.yaml
 .PHONY: binaries
@@ -73,3 +73,11 @@ binaries:
 .PHONY: test
 test:
 	$(PYTHON) -m unittest discover -s tests -v
+
+.PHONY: validate
+validate:
+	$(PYTHON) tools/deployctl.py validate
+
+.PHONY: deployctl-config
+deployctl-config:
+	$(PYTHON) tools/deployctl.py config
