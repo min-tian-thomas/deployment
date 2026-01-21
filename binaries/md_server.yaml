@@ -1,0 +1,5 @@
+name: md_server
+tags:
+  prod: v1.2.3
+  staging: v1.2.4-rc1
+  latest: v1.2.4

@@ -1,0 +1,4 @@
+dce_md_publisher:
+  binary: md_server
+  tag: prod
+  config_template: dce_md_publisher.json

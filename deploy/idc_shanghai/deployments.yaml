@@ -1,0 +1,13 @@
+deployments:
+  host01:
+    shared_cpus: 0, 1  # for logging and admin
+    
+    dce_md_publisher:
+      isolated_cpus: 2
+      cfg_envs:
+        -
+          listen_nic: eth0
+          listen_port: 8080
+          log_cpu: 0
+          main_loop_cpu: 2
+          admin_loop_cpu: 1

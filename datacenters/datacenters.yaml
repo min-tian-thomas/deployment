@@ -1,0 +1,13 @@
+datacenters:
+  - id: idc_shanghai
+    hosts:
+      - name: host01
+        cpus: 16
+        numa_nodes: 2
+        log_cpus: 0,1
+        isolated_cpus: 2-15
+        nics:
+          - name: eth0
+            type: ethernet
+          - name: sf0
+            type: solarflare
