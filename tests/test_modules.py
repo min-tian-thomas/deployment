@@ -177,6 +177,275 @@ host01:
             with self.assertRaises(SystemExit):
                 validate_all_schemas(root)
 
+    def test_schema_validation_depends_on_inferred_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "deployments" / "idc_test" / "templates").mkdir(parents=True)
+            (root / "install").mkdir(parents=True)
+
+            (root / "deployments" / "required_binaries.yaml").write_text(
+                """
+md_server:
+  tags:
+    prod: v1
+  required_versions:
+    - v1
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "hosts.yaml").write_text(
+                """
+host01:
+  cpus: 2
+  isolated_cpus: 1
+  shared_cpus: 0
+  nics:
+    - name: eth0
+      ip: 127.0.0.1
+      type: ethernet
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "templates" / "pub.json").write_text(
+                '{"listen_port": 12800}\n'
+            )
+            (root / "deployments" / "idc_test" / "templates" / "rec.json").write_text(
+                '{"x": "{{pub.listen_port}}"}\n'
+            )
+
+            (root / "deployments" / "idc_test" / "deployments.yaml").write_text(
+                """
+host01:
+  pub:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: pub.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+          listen_port: 12800
+  rec:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: rec.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+""".lstrip()
+            )
+
+            # rec 模板引用了 pub，但未显式写 depends_on，应该通过（自动推导）
+            validate_all_schemas(root)
+
+    def test_schema_validation_depends_on_missing_referenced_app_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "deployments" / "idc_test" / "templates").mkdir(parents=True)
+            (root / "install").mkdir(parents=True)
+
+            (root / "deployments" / "required_binaries.yaml").write_text(
+                """
+md_server:
+  tags:
+    prod: v1
+  required_versions:
+    - v1
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "hosts.yaml").write_text(
+                """
+host01:
+  cpus: 2
+  isolated_cpus: 1
+  shared_cpus: 0
+  nics:
+    - name: eth0
+      ip: 127.0.0.1
+      type: ethernet
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "templates" / "pub.json").write_text(
+                '{"listen_port": 12800}\n'
+            )
+            (root / "deployments" / "idc_test" / "templates" / "rec.json").write_text(
+                '{"x": "{{pub.listen_port}}"}\n'
+            )
+
+            (root / "deployments" / "idc_test" / "deployments.yaml").write_text(
+                """
+host01:
+  pub:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: pub.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+          listen_port: 12800
+  rec:
+    binary: md_server
+    tag: prod
+    depends_on:
+      - other_app
+    templates:
+      - name: rec.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+""".lstrip()
+            )
+
+            with self.assertRaises(SystemExit):
+                validate_all_schemas(root)
+
+    def test_schema_validation_depends_on_extra_only_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "deployments" / "idc_test" / "templates").mkdir(parents=True)
+            (root / "install").mkdir(parents=True)
+
+            (root / "deployments" / "required_binaries.yaml").write_text(
+                """
+md_server:
+  tags:
+    prod: v1
+  required_versions:
+    - v1
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "hosts.yaml").write_text(
+                """
+host01:
+  cpus: 2
+  isolated_cpus: 1
+  shared_cpus: 0
+  nics:
+    - name: eth0
+      ip: 127.0.0.1
+      type: ethernet
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "templates" / "pub.json").write_text(
+                '{"listen_port": 12800}\n'
+            )
+            (root / "deployments" / "idc_test" / "templates" / "rec.json").write_text(
+                '{"x": "{{pub.listen_port}}"}\n'
+            )
+
+            (root / "deployments" / "idc_test" / "deployments.yaml").write_text(
+                """
+host01:
+  pub:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: pub.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+          listen_port: 12800
+  extra_app:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: pub.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+          listen_port: 12800
+  rec:
+    binary: md_server
+    tag: prod
+    depends_on:
+      - pub
+      - extra_app
+    templates:
+      - name: rec.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+""".lstrip()
+            )
+
+            # 只应打印 warning，不应失败
+            validate_all_schemas(root)
+
+    def test_schema_validation_depends_on_unknown_app_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "deployments" / "idc_test" / "templates").mkdir(parents=True)
+            (root / "install").mkdir(parents=True)
+
+            (root / "deployments" / "required_binaries.yaml").write_text(
+                """
+md_server:
+  tags:
+    prod: v1
+  required_versions:
+    - v1
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "hosts.yaml").write_text(
+                """
+host01:
+  cpus: 2
+  isolated_cpus: 1
+  shared_cpus: 0
+  nics:
+    - name: eth0
+      ip: 127.0.0.1
+      type: ethernet
+""".lstrip()
+            )
+
+            (root / "deployments" / "idc_test" / "templates" / "a.json").write_text(
+                "{}\n"
+            )
+
+            (root / "deployments" / "idc_test" / "deployments.yaml").write_text(
+                """
+host01:
+  a:
+    binary: md_server
+    tag: prod
+    templates:
+      - name: a.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+  b:
+    binary: md_server
+    tag: prod
+    depends_on:
+      - non_exist_app
+    templates:
+      - name: a.json
+        cfg_envs:
+          log_cpu: 0
+          main_loop_cpu: 1
+          admin_loop_cpu: 0
+""".lstrip()
+            )
+
+            with self.assertRaises(SystemExit):
+                validate_all_schemas(root)
+
     def test_schema_validation_shm_cross_host_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -48,7 +48,7 @@ deployment/
           dce_md_recorder_backup
 
   tools/
-    deployctl.py                # 统一 CLI 入口：validate / binaries / config（推荐直接使用）
+    deployctl.py                # 统一 CLI 入口：validate / binaries / config / plan（推荐直接使用）
     gen_config.py               # 配置生成与校验核心逻辑（内部模块，由 deployctl 调用）
 
   Makefile                      # make binaries / make config 等辅助命令
@@ -166,7 +166,7 @@ host01:
     type: framework           # framework / external，区分是否遵循统一应用框架约定
     binary: md_server
     tag: prod
-    depends_on:               # 可选：声明依赖的其它应用，用于 plan/start/stop 顺序
+    depends_on:               # 可选：声明依赖的其它应用，用于 plan/start/stop 顺序 （默认可以从configure template中获取）
       - dce_md_recorder
     start_cmd: "./dce_md_publisher"          # 可选：覆盖默认启动命令
     stop_cmd: "kill $(cat dce_md_publisher.pid)"   # 可选：覆盖默认停止命令
@@ -181,9 +181,9 @@ host01:
           listen_port: 12800
 ```
 
-> 上述扩展字段目前仅作为未来规划的 schema 约定：
-> - 现有工具链不会强制解析/执行 `start_cmd` / `stop_cmd` / `validate_cmd`；
-> - 后续若引入 `deployctl plan/start/stop` 等子命令，可基于这些字段实现更强的生命周期编排。
+> 上述扩展字段中：
+> - `depends_on` **已经** 被用于 schema 校验和 `deployctl plan` 的依赖顺序计算；
+> - `type` / `start_cmd` / `stop_cmd` / `validate_cmd` 目前仍仅作为未来规划的 schema 约定，现有工具链不会执行这些命令，后续若引入 `deployctl start/stop` 等子命令，可基于这些字段实现更强的生命周期编排。
 
 CPU / NUMA 相关约束：
 
@@ -318,6 +318,16 @@ python tools/deployctl.py config --dc idc_shanghai --host host01 --app dce_md_pu
   - 生成配置文件到 `install/<dc>/<host>/<app>/`；
   - 为应用创建指向正确版本二进制的 symlink。
 
+- `deployctl plan` 会在成功通过 schema 校验后，根据 `depends_on`（或从模板自动推导的依赖）计算应用的启动/停止顺序，当前仅打印计划，不执行任何命令：
+
+  ```bash
+  python tools/deployctl.py plan --dc idc_shanghai --host host01
+  python tools/deployctl.py plan --app dce_md_recorder
+  ```
+
+  - 输出中的 `Start order` 可作为未来 `start` 调度的顺序参考；
+  - 输出中的 `Stop order` 为反向顺序，可作为未来 `stop` 调度的顺序参考。
+
 ---
 
 ## 约束与校验规则（非常重要）
@@ -356,6 +366,12 @@ python tools/deployctl.py config --dc idc_shanghai --host host01 --app dce_md_pu
   - 若引用 `listen_nic`：
     - 必须能在被引用 application 所在 host 的 `hosts.yaml` 中找到对应网卡名并解析到 IP，否则报错。
 
+- 依赖关系（`depends_on`）与跨应用引用
+  - 若应用未显式写 `depends_on`，工具会根据模板中的 `{{OtherApp.key}}` 自动推导依赖关系（仅用于 `deployctl plan` 的顺序计算，不会回写或修改原始 YAML）。
+  - 若应用显式写了 `depends_on`：
+    - 所有在模板中通过 `{{OtherApp.key}}` 引用到的应用，必须出现在 `depends_on` 中，否则 `make validate` 会报错；
+    - 多写的 `depends_on` 项不会导致校验失败，但会在 `make validate` 阶段打印 warning，提醒是否为冗余依赖。
+
 ---
 
 ## 后续可扩展方向
@@ -364,8 +380,8 @@ python tools/deployctl.py config --dc idc_shanghai --host host01 --app dce_md_pu
 - **CLI 增强**：增加 `--strict/--warn`、`--dry-run`、更详细的诊断信息；
 - **模板能力扩展**：在 Jinja2 基础上引入公共片段/宏，支持更复杂的占位符组合；
 - **与远端系统对接**：将本地生成的 `install/` 目录与远程部署/发布系统打通（目前仅支持本地生成，不涉及远程分发）。
-- **应用生命周期管理**：支持应用的启动/停止/重启/版本升级等生命周期管理，例如通过 `./app -v/-c` 等命令行工具。
-- **依赖关系与调度**：支持应用之间的依赖关系，并根据依赖关系进行调度和排序，确保应用按照正确的顺序启动和停止。
+- **应用生命周期管理**：在 `deployments.yaml` 中约定的 `type` / `start_cmd` / `stop_cmd` / `validate_cmd` 基础上，支持应用的启动/停止/重启/版本升级等生命周期管理（未来可由 `deployctl start/stop` 等子命令实现）。
+- **依赖关系与调度**：在当前 `depends_on` + `deployctl plan` 输出的顺序之上，进一步扩展到实际的调度与编排策略（例如滚动启动、灰度发布等），确保应用按照正确且可控的顺序启动和停止。
 - **非框架应用支持**：支持非框架应用（即不遵循标准应用框架的应用）的部署和管理，例如通过提供特定的配置文件或命令行参数。
 
 ---

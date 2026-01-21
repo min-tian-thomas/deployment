@@ -13,6 +13,8 @@ host01:
           listen_port: 12800
           broadcast_queue_shm_path: /dev/shm/dce_md_publisher_broadcast_queue
   dce_md_recorder:
+    depends_on: 
+      - dce_md_publisher
     binary: md_recorder
     tag: prod
     templates:
@@ -24,6 +26,8 @@ host01:
 host02:
   log_dir: /tmp/logs
   dce_md_recorder_backup:
+    depends_on: 
+      - dce_md_publisher
     binary: md_recorder
     tag: prod
     templates:

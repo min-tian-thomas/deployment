@@ -247,15 +247,32 @@ def _validate_cross_app_refs(
         host_obj = _as_mapping(dep_map.get(host_name) or {}, f"deployments/{dc_id}/deployments.yaml:{host_name}")
         app_obj = _as_mapping(host_obj.get(app_name) or {}, f"deployments/{dc_id}/deployments.yaml:{host_name}.{app_name}")
 
-        templates = _as_list(app_obj.get("templates"), f"deployments/{dc_id}/deployments.yaml:{host_name}.{app_name}.templates")
+        actx = f"deployments/{dc_id}/deployments.yaml:{host_name}.{app_name}"
+
+        # 读取显式声明的 depends_on（如果有）
+        declared_deps: set[str] | None
+        raw_depends = app_obj.get("depends_on")
+        if raw_depends is None:
+            declared_deps = None
+        else:
+            dep_list = _as_list(raw_depends, actx + ".depends_on")
+            declared_deps = set()
+            for i, dep in enumerate(dep_list):
+                dep_name = _as_str(dep, actx + f".depends_on[{i}]")
+                declared_deps.add(dep_name)
+
+        referenced_apps: set[str] = set()
+
+        templates = _as_list(app_obj.get("templates"), actx + ".templates")
         for i, tmpl in enumerate(templates):
-            tctx = f"deployments/{dc_id}/deployments.yaml:{host_name}.{app_name}.templates[{i}]"
+            tctx = actx + f".templates[{i}]"
             tmpl_obj = _as_mapping(tmpl, tctx)
             template_name = _as_str(tmpl_obj.get("name"), tctx + ".name")
             template_path = root / "deployments" / dc_id / "templates" / template_name
             template_text = template_path.read_text()
 
             for ref_app, ref_key in set(placeholder_pattern.findall(template_text)):
+                referenced_apps.add(ref_app)
                 ref_loc = app_index.get(ref_app)
                 if ref_loc is None:
                     raise SystemExit(
@@ -315,6 +332,41 @@ def _validate_cross_app_refs(
                                 f"ip for nic '{nic_name}' not found in hosts.yaml for referenced app '{ref_app}' (dc={ref_dc}, host={ref_host})",
                             )
                         )
+
+        # 校验 depends_on 与实际跨应用引用的一致性，以及被依赖应用是否存在
+        if declared_deps is not None:
+            # 1) depends_on 中声明的应用必须在全局 app_index 中存在
+            unknown = sorted(d for d in declared_deps if d not in app_index)
+            if unknown:
+                raise SystemExit(
+                    _schema_err(
+                        actx + ".depends_on",
+                        "depends_on contains unknown applications: " f"{unknown}",
+                    )
+                )
+
+            # 2) 所有模板中引用到的 app 必须被 depends_on 覆盖
+            missing = referenced_apps - declared_deps
+            if missing:
+                raise SystemExit(
+                    _schema_err(
+                        actx + ".depends_on",
+                        "depends_on is missing applications referenced in templates: "
+                        f"{sorted(missing)}",
+                    )
+                )
+
+            # 3) 多写的 depends_on 项仅打印 warning（前提是这些 app 确实存在）
+            extra = declared_deps - referenced_apps
+            if extra:
+                # 仅告警，不阻止通过
+                print(
+                    "[validate][warning] app '{app}' has extra depends_on entries "
+                    "not referenced in templates: {extras}".format(
+                        app=app_name,
+                        extras=sorted(extra),
+                    )
+                )
 
 
 def validate_all_schemas(root: Path) -> None:
