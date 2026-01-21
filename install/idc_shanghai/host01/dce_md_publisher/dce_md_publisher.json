@@ -1,7 +1,8 @@
 {
     "logging": {
         "log_level": "Info",
-        "log_cpu": "0"
+        "log_cpu": "0",
+        "log_dir": "/tmp/logs/dce_md_publisher"
     },
     "event_loops": [
         {
@@ -17,7 +18,5 @@
     ],
     "listen_nic": "192.168.1.101",
     "listen_port": "12800",
-    "broadcast_queue_shm": "{{broadcast_queue_shm_path}}"
-
+    "broadcast_queue_shm": "/dev/shm/dce_md_publisher_broadcast_queue"
 }
-

@@ -166,6 +166,7 @@ def load_deployment(dc_id: str, host_name: str, app_name: str) -> Dict:
 
         return {
             "shared_cpus": host_cfg.get("shared_cpus", ""),
+            "log_dir": host_cfg.get("log_dir"),
             "app": app_def,
         }
 
@@ -183,6 +184,7 @@ def load_deployment(dc_id: str, host_name: str, app_name: str) -> Dict:
 
     return {
         "shared_cpus": "",  # shared_cpus 由 hosts.yaml 提供
+        "log_dir": host_cfg.get("log_dir"),
         "app": app_def,
     }
 
@@ -288,12 +290,25 @@ def validate_and_render(
     isolated_cpus = parse_cpu_set(str(host.get("isolated_cpus", "")))
     host_shared_cpus = parse_cpu_set(str(host.get("shared_cpus", "")))
 
+    for cpu in sorted(isolated_cpus | host_shared_cpus):
+        if cpu < 0 or cpu >= total_cpus:
+            raise SystemExit(
+                f"cpu id {cpu} out of range [0, {total_cpus}) in hosts.yaml for host {host_name}"
+            )
+    overlap = isolated_cpus & host_shared_cpus
+    if overlap:
+        raise SystemExit(
+            f"isolated_cpus and shared_cpus overlap for host {host_name}: {sorted(overlap)}"
+        )
+
     cpu_numa = build_cpu_numa_map_from_host(host)
 
     dep_info = load_deployment(dc_id, host_name, app_name)
     dep_shared_cpus = parse_cpu_set(str(dep_info.get("shared_cpus", "")))
     # 优先使用 hosts.yaml 中的 shared_cpus，兼容旧 schema 时退回 deployments 里的 shared_cpus
     shared_cpus = host_shared_cpus or dep_shared_cpus
+
+    host_log_dir = dep_info.get("log_dir")
 
     app_def: Dict = dep_info["app"]
 
@@ -366,10 +381,14 @@ def validate_and_render(
                 )
             busy_usage[main_loop_cpu] = app_name
 
-            # 2) log_cpu 必须在 shared_cpus 范围内
             if log_cpu not in shared_cpus:
                 raise SystemExit(
                     f"log_cpu {log_cpu} not in shared_cpus {sorted(shared_cpus)}"
+                )
+
+            if admin_loop_cpu not in shared_cpus:
+                raise SystemExit(
+                    f"admin_loop_cpu {admin_loop_cpu} not in shared_cpus {sorted(shared_cpus)}"
                 )
 
             # 3) 所有 cpu id 必须在合法范围 [0, total_cpus)
@@ -415,13 +434,16 @@ def validate_and_render(
                         f"ip for nic '{nic_name}' not found in hosts.yaml for host '{host_name}'"
                     )
 
-            replacements = {
-                "listen_nic": nic_ip if nic_ip is not None else nic_name,
-                "listen_port": env.get("listen_port"),
-                "log_cpu": log_cpu,
-                "main_loop_cpu": main_loop_cpu,
-                "admin_loop_cpu": admin_loop_cpu,
-            }
+            replacements = dict(env)
+            replacements.update(
+                {
+                    "listen_nic": nic_ip if nic_ip is not None else nic_name,
+                    "listen_port": env.get("listen_port"),
+                    "log_cpu": log_cpu,
+                    "main_loop_cpu": main_loop_cpu,
+                    "admin_loop_cpu": admin_loop_cpu,
+                }
+            )
 
             # 通用跨实例引用：支持 {{AppName.key}}，可以跨 host / 跨 dc。
             cross_refs: Dict[str, str] = {}
@@ -441,14 +463,15 @@ def validate_and_render(
 
                 ref_dc, ref_host = mapping
 
-                # 任何带 shm 的 key 都被认为是共享内存相关配置，必须保证引用方和被引用方在同一台机器上
-                if "shm" in ref_key.lower() and host_name != ref_host:
+                if "shm" in ref_key.lower() and (dc_id != ref_dc or host_name != ref_host):
                     raise SystemExit(
                         "shared-memory key '{app}.{key}' must be used on the same host "
-                        "(referencer host={h_ref}, owner host={h_owner})".format(
+                        "(referencer dc={dc_ref}, host={h_ref}, owner dc={dc_owner}, host={h_owner})".format(
                             app=ref_app,
                             key=ref_key,
+                            dc_ref=dc_id,
                             h_ref=host_name,
+                            dc_owner=ref_dc,
                             h_owner=ref_host,
                         )
                     )
@@ -505,19 +528,104 @@ def validate_and_render(
 
             rendered = template_text
             for key, value in replacements.items():
-                rendered = rendered.replace("{{" + key + "}}", str(value))
+                rendered = re.sub(
+                    r"{{\s*" + re.escape(str(key)) + r"\s*}}", str(value), rendered
+                )
 
-            # 简单校验生成的 JSON 是否合法
+            leftover = re.findall(r"{{\s*[^}]+\s*}}", rendered)
+            if leftover:
+                raise SystemExit(
+                    f"unresolved template variables in rendered config for app '{app_name}' "
+                    f"(template {template_name}): {sorted(set(leftover))}"
+                )
+
             try:
-                json.loads(rendered)
+                rendered_obj = json.loads(rendered)
             except json.JSONDecodeError as e:
                 print("Rendered JSON is invalid:")
                 print(rendered)
                 raise SystemExit(f"failed to parse rendered JSON: {e}")
 
+            if not isinstance(rendered_obj, dict):
+                raise SystemExit(
+                    f"rendered JSON must be an object for app '{app_name}' (template {template_name})"
+                )
+
+            if host_log_dir is not None:
+                logging_obj = rendered_obj.get("logging")
+                if not isinstance(logging_obj, dict):
+                    raise SystemExit(
+                        f"host log_dir is set but 'logging' is missing or not an object "
+                        f"in config for app '{app_name}' (template {template_name})"
+                    )
+                logging_obj["log_dir"] = str(Path(str(host_log_dir)) / app_name)
+
+            loops_obj = rendered_obj.get("event_loops")
+            if not isinstance(loops_obj, list):
+                raise SystemExit(
+                    f"'event_loops' is missing or not a list in config for app '{app_name}' (template {template_name})"
+                )
+
+            has_admin_loop = False
+            for loop in loops_obj:
+                if not isinstance(loop, dict):
+                    continue
+
+                loop_name = loop.get("name")
+                busy_spin = loop.get("busy_spin")
+                cpu_id_raw = loop.get("cpu_id")
+                try:
+                    cpu_id = int(cpu_id_raw)
+                except (TypeError, ValueError):
+                    raise SystemExit(
+                        f"invalid cpu_id '{cpu_id_raw}' in event_loops for app '{app_name}' (template {template_name})"
+                    )
+
+                if cpu_id < 0 or cpu_id >= total_cpus:
+                    raise SystemExit(
+                        f"cpu id {cpu_id} out of range [0, {total_cpus}) in event_loops for app '{app_name}'"
+                    )
+
+                if loop_name == "admin_loop":
+                    has_admin_loop = True
+                    if busy_spin is not False:
+                        raise SystemExit(
+                            f"admin_loop must have busy_spin=false for app '{app_name}' (template {template_name})"
+                        )
+                    if cpu_id != admin_loop_cpu:
+                        raise SystemExit(
+                            f"admin_loop cpu_id {cpu_id} does not match cfg_envs.admin_loop_cpu {admin_loop_cpu} "
+                            f"for app '{app_name}' (template {template_name})"
+                        )
+
+                if busy_spin is True:
+                    if cpu_id not in isolated_cpus:
+                        raise SystemExit(
+                            f"busy_spin loop '{loop_name}' cpu_id {cpu_id} not in isolated_cpus {sorted(isolated_cpus)}"
+                        )
+
+                    host_key = (dc_id, host_name)
+                    busy_usage = HOST_BUSY_ISOLATED_USAGE.setdefault(host_key, {})
+                    if cpu_id in busy_usage and busy_usage[cpu_id] != app_name:
+                        raise SystemExit(
+                            "busy_spin cpu {cpu} already used by app '{other}' on host '{host}' ".format(
+                                cpu=cpu_id,
+                                other=busy_usage[cpu_id],
+                                host=host_name,
+                            )
+                        )
+                    busy_usage[cpu_id] = app_name
+
+            if not has_admin_loop:
+                raise SystemExit(
+                    f"admin_loop not found in event_loops for app '{app_name}' (template {template_name})"
+                )
+
+            rendered = json.dumps(rendered_obj, indent=4) + "\n"
+
             # 写入配置文件：使用模板名作为文件名
             cfg_path = apps_root / template_name
-            cfg_path.write_text(rendered + "\n")
+            cfg_path.write_text(rendered)
             last_cfg_path = cfg_path
 
         # 解析 binary + tag/version，创建或指向具体版本的二进制
@@ -701,6 +809,12 @@ def refresh_deployment_comments_for_dc(
 
         lines.append(f"{host_name}:")
 
+        if "log_dir" in apps_map:
+            lines.append(f"  log_dir: {apps_map.get('log_dir')}")
+
+        if "shared_cpus" in apps_map:
+            lines.append(f"  shared_cpus: {apps_map.get('shared_cpus')}")
+
         host_topology = hosts_data.get(host_name) or {}
         try:
             cpu_numa = build_cpu_numa_map_from_host(host_topology)
@@ -715,6 +829,10 @@ def refresh_deployment_comments_for_dc(
                 nic_ips[name] = str(ip)
 
         for app_name, app_def in apps_map.items():
+            if app_name == "log_dir":
+                continue
+            if app_name == "shared_cpus":
+                continue
             if not isinstance(app_def, dict):
                 continue
 

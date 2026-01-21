@@ -1,8 +1,8 @@
 {
-
     "logging": {
         "log_level": "Info",
-        "log_cpu": "0"
+        "log_cpu": "0",
+        "log_dir": "/tmp/logs/dce_md_recorder_backup"
     },
     "event_loops": [
         {
@@ -19,4 +19,3 @@
     "connect_host": "192.168.1.101",
     "connect_port": "12800"
 }
-

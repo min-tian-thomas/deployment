@@ -1,8 +1,8 @@
 {
-
     "logging": {
         "log_level": "Info",
-        "log_cpu": "0"
+        "log_cpu": "0",
+        "log_dir": "/tmp/logs/dce_md_recorder"
     },
     "event_loops": [
         {
@@ -18,4 +18,3 @@
     ],
     "broadcast_queue_shm": "/dev/shm/dce_md_publisher_broadcast_queue"
 }
-

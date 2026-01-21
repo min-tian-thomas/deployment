@@ -1,4 +1,5 @@
 host01:
+  log_dir: /tmp/logs
   dce_md_publisher:
     binary: md_server
     tag: prod
@@ -21,6 +22,7 @@ host01:
           main_loop_cpu: 2  # numa 0
           admin_loop_cpu: 1  # numa 0
 host02:
+  log_dir: /tmp/logs
   dce_md_recorder_backup:
     binary: md_recorder
     tag: prod
