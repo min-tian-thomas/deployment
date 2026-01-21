@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 import yaml
+
+from schema_validation import validate_all_schemas
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -902,6 +903,8 @@ def generate_all() -> None:
     if not deploy_root.exists():
         return
 
+    validate_all_schemas(ROOT)
+
     # 第一遍：构建全局 APP 索引，强制 app_name 在所有 dc/host 之间唯一
     for dc_dir in deploy_root.iterdir():
         if not dc_dir.is_dir():
@@ -1043,63 +1046,10 @@ def generate_all() -> None:
                     print(f"  failed: {e}", file=sys.stderr)
 
 
-def prepare_all_binaries() -> None:
-    """根据 deployments/required_binaries.yaml 中的 required_versions 布局所有 mock 二进制文件，并清理不再需要的版本。
-
-    生成目录位于 install/binaries/ 下。
-    """
-
-    binaries_root = ROOT / "install" / "binaries"
-    binaries_root.mkdir(parents=True, exist_ok=True)
-
-    data = load_binary_requirements()
-
-    for binary_name, cfg in data.items():
-        if not isinstance(cfg, dict):
-            continue
-
-        required_versions_raw = cfg.get("required_versions") or []
-        required_versions = {str(v) for v in required_versions_raw}
-        if not required_versions:
-            continue
-
-        bin_root = binaries_root / binary_name
-        bin_root.mkdir(parents=True, exist_ok=True)
-
-        # 为所有 required_versions 创建 mock 二进制
-        for version in sorted(required_versions):
-            print(f"[binary] {binary_name}:{version}")
-            bin_dir = bin_root / version
-            bin_dir.mkdir(parents=True, exist_ok=True)
-            bin_path = bin_dir / binary_name
-            if not bin_path.exists():
-                bin_path.write_text(
-                    "#!/usr/bin/env bash\n"
-                    f"echo 'mock {binary_name} {version}' \"$@\"\n",
-                    encoding="utf-8",
-                )
-                try:
-                    bin_path.chmod(0o755)
-                except PermissionError:
-                    pass
-
-        # 清理不在 required_versions 中的旧版本目录
-        if bin_root.exists():
-            for child in bin_root.iterdir():
-                if not child.is_dir():
-                    continue
-                if child.name not in required_versions:
-                    print(f"[binary-clean] removing obsolete version: {binary_name}/{child.name}")
-                    shutil.rmtree(child, ignore_errors=True)
-
-
 if __name__ == "__main__":
     # 无参数：全局生成配置
     if len(sys.argv) == 1:
         generate_all()
-    # 单参数："binaries"，只准备 mock 二进制布局
-    elif len(sys.argv) == 2 and sys.argv[1] == "binaries":
-        prepare_all_binaries()
     # 2 个参数：dc host（默认 APP_NAME）
     elif len(sys.argv) == 3:
         _, dc, host = sys.argv

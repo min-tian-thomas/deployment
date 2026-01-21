@@ -68,4 +68,4 @@ config:
 # Prepare mock binaries layout based on binaries/*.yaml
 .PHONY: binaries
 binaries:
-	$(PYTHON) tools/gen_config.py binaries
+	$(PYTHON) tools/gen_binaries.py

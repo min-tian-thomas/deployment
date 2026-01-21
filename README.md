@@ -270,7 +270,7 @@ make binaries
 make config
 ```
 
-- `make binaries` 会调用 `tools/gen_config.py binaries`，对 `deployments/required_binaries.yaml` 中定义的每个 binary：
+- `make binaries` 会调用 `tools/gen_binaries.py`，对 `deployments/required_binaries.yaml` 中定义的每个 binary：
   - 为所有 `required_versions` 生成（或校验存在）mock 二进制 `install/binaries/<name>/<version>/<name>`；
   - 删除不在 `required_versions` 中的旧版本目录。
 
