@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import yaml
 
@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # 当前 MVP 仅支持单一应用 dce_md_publisher
 APP_NAME = "dce_md_publisher"
+
+# 记录同一 host 上 busy-spin（main_loop_cpu）在 isolated_cpus 中的使用情况，用于跨应用去重校验
+HOST_BUSY_ISOLATED_USAGE: Dict[Tuple[str, str], Dict[int, str]] = {}
 
 
 def parse_cpu_set(expr: str) -> Set[int]:
@@ -40,7 +43,7 @@ def parse_cpu_set(expr: str) -> Set[int]:
 def load_datacenter(dc_id: str, host_name: str) -> Dict:
     """加载某个 DC 下指定主机的拓扑信息。
 
-    现在的拓扑文件放在 deploy/<dc>/hosts.yaml，结构类似：
+    现在的拓扑文件放在 deployments/<dc>/hosts.yaml，结构类似：
 
     datacenters:
       - id: idc_shanghai
@@ -55,7 +58,7 @@ def load_datacenter(dc_id: str, host_name: str) -> Dict:
             ...
     """
 
-    dc_file = ROOT / "deploy" / dc_id / "hosts.yaml"
+    dc_file = ROOT / "deployments" / dc_id / "hosts.yaml"
     if not dc_file.exists():
         raise SystemExit(f"hosts topology file not found for datacenter '{dc_id}': {dc_file}")
 
@@ -137,7 +140,7 @@ def load_deployment(dc_id: str, host_name: str, app_name: str) -> Dict:
           cfg_envs: [...]
     """
 
-    dep_file = ROOT / "deploy" / dc_id / "deployments.yaml"
+    dep_file = ROOT / "deployments" / dc_id / "deployments.yaml"
     with dep_file.open() as f:
         data = yaml.safe_load(f) or {}
 
@@ -199,9 +202,9 @@ def load_app_config(app_name: str) -> Dict:
 
 
 def load_binary_requirements() -> Dict[str, Dict]:
-    """加载 binaries/requirements.yaml 中的全部 binary 定义。"""
+    """加载 deployments/required_binaries.yaml 中的全部 binary 定义。"""
 
-    req_file = ROOT / "binaries" / "requirements.yaml"
+    req_file = ROOT / "deployments" / "required_binaries.yaml"
     if not req_file.exists():
         raise SystemExit(f"binary requirements file not found: {req_file}")
 
@@ -215,18 +218,21 @@ def load_binary_requirements() -> Dict[str, Dict]:
 
 
 def load_binary_target(binary_name: str, tag_or_version: str) -> Path:
-    """根据 binaries/requirements.yaml 解析出具体版本的本地路径，并返回目标二进制路径。
+    """根据 deployments/required_binaries.yaml 解析出具体版本的本地路径，并返回目标二进制路径。
 
     约定目录结构：
 
-    binaries/
-      requirements.yaml
-      md_server/
-        v1.2.3/
-          md_server          # 实际二进制文件（本 MVP 中可为 mock）
+    deployments/
+      required_binaries.yaml
+
+    install/
+      binaries/
+        md_server/
+          v1.2.3/
+            md_server          # 实际二进制文件（本 MVP 中可为 mock）
     """
 
-    req_file = ROOT / "binaries" / "requirements.yaml"
+    req_file = ROOT / "deployments" / "required_binaries.yaml"
     data = load_binary_requirements()
 
     binary_cfg: Dict = data.get(binary_name) or {}
@@ -249,7 +255,7 @@ def load_binary_target(binary_name: str, tag_or_version: str) -> Path:
             f"for binary '{binary_name}' in {req_file}"
         )
 
-    bin_dir = ROOT / "binaries" / binary_name / version
+    bin_dir = ROOT / "install" / "binaries" / binary_name / version
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     bin_path = bin_dir / binary_name
@@ -286,8 +292,8 @@ def validate_and_render(
 
     app_def: Dict = dep_info["app"]
 
-    # 构建应用目录结构：deploy/<dc>/<host>/<app>/
-    apps_root = ROOT / "deploy" / dc_id / host_name / app_name
+    # 构建应用目录结构：install/<dc>/<host>/<app>/
+    apps_root = ROOT / "install" / dc_id / host_name / app_name
     apps_root.mkdir(parents=True, exist_ok=True)
 
     # 新写法：deployments.yaml 中为每个 app 定义 binary/tag 和 templates 列表
@@ -341,6 +347,20 @@ def validate_and_render(
                     f"main_loop_cpu {main_loop_cpu} not in isolated_cpus {sorted(isolated_cpus)}"
                 )
 
+            # 1.1) 同一 host 上所有 app 的 busy-spin 核在 isolated_cpus 上不允许重复使用
+            host_key = (dc_id, host_name)
+            busy_usage = HOST_BUSY_ISOLATED_USAGE.setdefault(host_key, {})
+            if main_loop_cpu in busy_usage and busy_usage[main_loop_cpu] != app_name:
+                raise SystemExit(
+                    "main_loop_cpu {cpu} already used by app '{other}' on host '{host}' "
+                    "(isolated_cpus must not be shared by busy-spin loops)".format(
+                        cpu=main_loop_cpu,
+                        other=busy_usage[main_loop_cpu],
+                        host=host_name,
+                    )
+                )
+            busy_usage[main_loop_cpu] = app_name
+
             # 2) log_cpu 必须在 shared_cpus 范围内
             if log_cpu not in shared_cpus:
                 raise SystemExit(
@@ -367,34 +387,72 @@ def validate_and_render(
                 node = cpu_numa.get(cpu, -1)
                 print(f"  cpu {cpu}: numa_node {node}")
 
-            template_path = ROOT / "deploy" / dc_id / "templates" / template_name
+            template_path = ROOT / "deployments" / dc_id / "templates" / template_name
             if not template_path.exists():
                 raise SystemExit(f"template file not found: {template_path}")
 
             template_text = template_path.read_text()
 
-            # 将 listen_nic (网卡名) 替换为对应 IP
-            nic_name = env.get("listen_nic")
-            if not nic_name:
-                raise SystemExit("listen_nic is not specified in cfg_envs")
-
+            # 将 listen_nic (网卡名) 替换为对应 IP；仅当模板中实际使用了 {{listen_nic}} 时才强制要求
+            needs_listen_nic = "{{listen_nic}}" in template_text
             nic_ip = None
-            for nic in host.get("nics", []):
-                if nic.get("name") == nic_name:
-                    nic_ip = nic.get("ip")
-                    break
-            if not nic_ip:
-                raise SystemExit(
-                    f"ip for nic '{nic_name}' not found in hosts.yaml for host '{host_name}'"
-                )
+            nic_name = env.get("listen_nic")
+            if needs_listen_nic:
+                if not nic_name:
+                    raise SystemExit("listen_nic is not specified in cfg_envs")
+
+                for nic in host.get("nics", []):
+                    if nic.get("name") == nic_name:
+                        nic_ip = nic.get("ip")
+                        break
+                if not nic_ip:
+                    raise SystemExit(
+                        f"ip for nic '{nic_name}' not found in hosts.yaml for host '{host_name}'"
+                    )
 
             replacements = {
-                "listen_nic": nic_ip,
+                "listen_nic": nic_ip if nic_ip is not None else nic_name,
                 "listen_port": env.get("listen_port"),
                 "log_cpu": log_cpu,
                 "main_loop_cpu": main_loop_cpu,
                 "admin_loop_cpu": admin_loop_cpu,
             }
+
+            # 支持在模板中引用其他实例（目前主要是 dce_md_publisher）的 env：
+            # 例如 {{dce_md_publisher.listen_nic}} / {{dce_md_publisher.listen_port}}
+            cross_refs: Dict[str, str] = {}
+            try:
+                pub_dep = load_deployment(dc_id, host_name, "dce_md_publisher")
+                pub_app_def: Dict = pub_dep.get("app") or {}
+
+                pub_templates = pub_app_def.get("templates")
+                if isinstance(pub_templates, list) and pub_templates:
+                    pub_tmpl0 = pub_templates[0]
+                    pub_cfg_envs = pub_tmpl0.get("cfg_envs") or {}
+                else:
+                    pub_cfg_envs = pub_app_def.get("cfg_envs") or {}
+
+                if isinstance(pub_cfg_envs, dict):
+                    pub_nic_name = pub_cfg_envs.get("listen_nic")
+                    pub_port = pub_cfg_envs.get("listen_port")
+
+                    if pub_nic_name:
+                        pub_ip = None
+                        for nic in host.get("nics", []):
+                            if nic.get("name") == pub_nic_name:
+                                pub_ip = nic.get("ip")
+                                break
+                        if pub_ip:
+                            cross_refs["dce_md_publisher.listen_nic"] = str(pub_ip)
+
+                    if pub_port is not None:
+                        cross_refs["dce_md_publisher.listen_port"] = str(pub_port)
+
+            except SystemExit:
+                # 如果 publisher 未定义或 schema 不匹配，则忽略交叉引用
+                pass
+
+            replacements.update(cross_refs)
 
             rendered = template_text
             for key, value in replacements.items():
@@ -458,6 +516,20 @@ def validate_and_render(
         raise SystemExit(
             f"main_loop_cpu {main_loop_cpu} not in isolated_cpus {sorted(isolated_cpus)}"
         )
+
+    # 1.1) 同一 host 上所有 app 的 busy-spin 核在 isolated_cpus 上不允许重复使用
+    host_key = (dc_id, host_name)
+    busy_usage = HOST_BUSY_ISOLATED_USAGE.setdefault(host_key, {})
+    if main_loop_cpu in busy_usage and busy_usage[main_loop_cpu] != app_name:
+        raise SystemExit(
+            "main_loop_cpu {cpu} already used by app '{other}' on host '{host}' "
+            "(isolated_cpus must not be shared by busy-spin loops)".format(
+                cpu=main_loop_cpu,
+                other=busy_usage[main_loop_cpu],
+                host=host_name,
+            )
+        )
+    busy_usage[main_loop_cpu] = app_name
 
     # 2) log_cpu 必须在 shared_cpus 范围内
     if log_cpu not in shared_cpus:
@@ -648,14 +720,17 @@ def generate_all() -> None:
     """遍历所有 datacenter/host/app，生成对应配置。
 
     依赖约定：
-    - 每个 dc 对应 deploy/<dc>/deployments.yaml
-    - 部分 dc 还可以有 deploy/<dc>/hosts.yaml，提供 CPU/NUMA 拓扑
+    - 每个 dc 对应 deployments/<dc>/deployments.yaml
+    - 部分 dc 还可以有 deployments/<dc>/hosts.yaml，提供 CPU/NUMA 拓扑
     - deployments.yaml 中：
         deployments[host].shared_cpus
         deployments[host][app_name] 为该 app 的部署定义
     """
 
-    deploy_root = ROOT / "deploy"
+    global HOST_BUSY_ISOLATED_USAGE
+    HOST_BUSY_ISOLATED_USAGE = {}
+
+    deploy_root = ROOT / "deployments"
     if not deploy_root.exists():
         return
 
@@ -735,13 +810,14 @@ def generate_all() -> None:
 
 
 def prepare_all_binaries() -> None:
-    """根据 binaries/requirements.yaml 中的 required_versions 布局所有 mock 二进制文件，并清理不再需要的版本。"""
+    """根据 deployments/required_binaries.yaml 中的 required_versions 布局所有 mock 二进制文件，并清理不再需要的版本。
 
-    binaries_dir = ROOT / "binaries"
-    if not binaries_dir.exists():
-        return
+    生成目录位于 install/binaries/ 下。
+    """
 
-    req_file = binaries_dir / "requirements.yaml"
+    binaries_root = ROOT / "install" / "binaries"
+    binaries_root.mkdir(parents=True, exist_ok=True)
+
     data = load_binary_requirements()
 
     for binary_name, cfg in data.items():
@@ -753,7 +829,7 @@ def prepare_all_binaries() -> None:
         if not required_versions:
             continue
 
-        bin_root = binaries_dir / binary_name
+        bin_root = binaries_root / binary_name
         bin_root.mkdir(parents=True, exist_ok=True)
 
         # 为所有 required_versions 创建 mock 二进制

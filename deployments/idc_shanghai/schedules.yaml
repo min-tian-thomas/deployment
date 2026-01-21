@@ -1,0 +1,17 @@
+defaults:
+  timezone: Asia/Shanghai
+
+schedules:
+  dce_md_publisher:
+    rules:
+      - sessions:
+          - ["09:00", "15:10"] # Day Session
+          - ["21:00", "03:10"] # Night Session (to the next day)
+        days: "mon-fri"
+
+  dce_md_recorder:
+    rules:
+      - sessions:
+          - ["09:01", "15:10"] # Day Session
+          - ["21:01", "03:10"] # Night Session (to the next day)
+        days: "mon-fri"

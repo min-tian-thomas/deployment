@@ -6,3 +6,10 @@ md_server:
   required_versions:
     - v1.2.3
     - v1.2.4-rc1
+
+md_recorder:
+  tags:
+    prod: v1.3.0
+    staging: v1.3.0
+  required_versions:
+    - v1.3.0

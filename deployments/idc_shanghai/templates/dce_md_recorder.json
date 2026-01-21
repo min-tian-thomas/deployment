@@ -1,0 +1,21 @@
+{
+
+    "logging": {
+        "log_level": "Info",
+        "log_cpu": "{{log_cpu}}"
+    },
+    "event_loops": [
+        {
+            "name": "main_loop",
+            "cpu_id": "{{main_loop_cpu}}",
+            "busy_spin": true
+        },
+        {
+            "name": "admin_loop",
+            "cpu_id": "{{admin_loop_cpu}}",
+            "busy_spin": false
+        }
+    ],
+    "connect_host": "{{dce_md_publisher.listen_nic}}",
+    "connect_port": "{{dce_md_publisher.listen_port}}"
+}

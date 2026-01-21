@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo 'mock md_recorder v1.3.0' "$@"
